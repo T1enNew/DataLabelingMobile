@@ -1,0 +1,45 @@
+{
+  "expo": {
+    "name": "DataLabel",
+    "slug": "data-label-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#0A0C10"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.team8.datalabel",
+      "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "Allow DataLabel to access photos for dataset upload.",
+        "NSCameraUsageDescription": "Allow DataLabel to use the camera.",
+        "NSPhotoLibraryAddUsageDescription": "Allow DataLabel to save images."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#0A0C10"
+      },
+      "package": "com.team8.datalabel",
+      "permissions": [
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE",
+        "CAMERA"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow DataLabel to access your photos.",
+          "cameraPermission": "Allow DataLabel to access your camera."
+        }
+      ],
+      "expo-document-picker"
+    ]
+  }
+}
