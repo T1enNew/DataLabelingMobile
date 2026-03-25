@@ -18,8 +18,14 @@ export const AuthProvider = ({ children }) => {
       const storedToken = await AsyncStorage.getItem('token');
       const storedUser = await AsyncStorage.getItem('user');
       if (storedToken && storedUser) {
-        setToken(storedToken);
-        setUser(JSON.parse(storedUser));
+        const parsedUser = JSON.parse(storedUser);
+        if (parsedUser?.role === 'reviewer') {
+          setToken(storedToken);
+          setUser(parsedUser);
+        } else {
+          await AsyncStorage.removeItem('token');
+          await AsyncStorage.removeItem('user');
+        }
       }
     } catch (e) {
       console.error('Load auth error:', e);
@@ -31,6 +37,11 @@ export const AuthProvider = ({ children }) => {
   const login = async (email, password) => {
     const res = await authAPI.login(email, password);
     const { token: t, user: u } = res.data;
+
+    if (u?.role !== 'reviewer') {
+      throw new Error('Ứng dụng chỉ cho phép đăng nhập bằng tài khoản reviewer.');
+    }
+
     await AsyncStorage.setItem('token', t);
     await AsyncStorage.setItem('user', JSON.stringify(u));
     setToken(t);

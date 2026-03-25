@@ -10,6 +10,7 @@ export default function ReviewerHistoryScreen({ navigation }) {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [filter, setFilter] = useState('all');
+  const [typeFilter, setTypeFilter] = useState('all');
 
   const loadTasks = useCallback(async () => {
     try {
@@ -28,46 +29,67 @@ export default function ReviewerHistoryScreen({ navigation }) {
     return unsub;
   }, [navigation, loadTasks]);
 
-  const filtered = filter === 'all' ? tasks : tasks.filter(t => t.status === filter);
+  const filteredByStatus = filter === 'all' ? tasks : tasks.filter(t => t.status === filter);
+  const filtered = filteredByStatus.filter((t) => {
+    if (typeFilter === 'all') return true;
+    const mime = (t?.dataItem?.mimeType || '').toLowerCase();
+    if (typeFilter === 'image') return mime.startsWith('image/');
+    if (typeFilter === 'text') return mime.startsWith('text/');
+    if (typeFilter === 'audio') return mime.startsWith('audio/');
+    return true;
+  });
 
-  const renderTask = ({ item }) => (
-    <Card
-      style={styles.card}
-      onPress={() => navigation.navigate('ReviewerTask', { taskId: item._id, mode: 'history' })}
-      accent={item.status === 'approved' ? COLORS.accent : COLORS.danger}
-    >
-      <View style={styles.cardHeader}>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.projectName} numberOfLines={1}>{item.projectId?.name || '-'}</Text>
-          <Text style={styles.fileName} numberOfLines={1}>File: {item.dataItem?.filename || '-'}</Text>
+  const renderTask = ({ item }) => {
+    const mime = item?.dataItem?.mimeType || '';
+    const typeMeta = mime.startsWith('audio/')
+      ? {
+          icon: 'musical-notes',
+          iconColor: '#FFD28C',
+          wrapBg: 'rgba(255,183,77,0.20)',
+          wrapBorder: 'rgba(255,183,77,0.55)',
+        }
+      : mime.startsWith('text/')
+        ? {
+            icon: 'document-text',
+            iconColor: '#B9C8FF',
+            wrapBg: 'rgba(167,139,250,0.20)',
+            wrapBorder: 'rgba(167,139,250,0.55)',
+          }
+        : {
+            icon: 'image',
+            iconColor: '#8FD7FF',
+            wrapBg: 'rgba(79,142,247,0.20)',
+            wrapBorder: 'rgba(79,142,247,0.55)',
+          };
+
+    return (
+      <Card
+        style={styles.card}
+        onPress={() => navigation.navigate('ReviewerTask', { taskId: item._id, mode: 'history' })}
+        accent={item.status === 'approved' ? COLORS.accent : COLORS.danger}
+      >
+        <View style={styles.cardHeaderCompact}>
+          <View style={[
+            styles.typeIconWrap,
+            { backgroundColor: typeMeta.wrapBg, borderColor: typeMeta.wrapBorder },
+          ]}>
+            <Ionicons name={typeMeta.icon} size={16} color={typeMeta.iconColor} />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.projectName} numberOfLines={1}>{item.projectId?.name || '-'}</Text>
+            <Text style={styles.metaLine} numberOfLines={1}>
+              {item.annotatorId?.fullName || '-'} • {item.reviewedAt ? new Date(item.reviewedAt).toLocaleDateString() : '-'}
+            </Text>
+          </View>
+          <StatusBadge status={item.status} small />
         </View>
-        <StatusBadge status={item.status} small />
-      </View>
-      <View style={styles.cardMeta}>
-        <View style={styles.metaItem}>
-          <Ionicons name="person-outline" size={12} color={COLORS.textMuted} />
-          <Text style={styles.metaText}>{item.annotatorId?.fullName || '-'}</Text>
-        </View>
-        <View style={styles.metaItem}>
-          <Ionicons name="time-outline" size={12} color={COLORS.textMuted} />
-          <Text style={styles.metaText}>
-            {item.reviewedAt ? new Date(item.reviewedAt).toLocaleDateString() : '-'}
-          </Text>
-        </View>
-      </View>
-      {item.status === 'rejected' && item.reviewComments && (
-        <View style={styles.rejectNote}>
-          <Ionicons name="warning-outline" size={13} color={COLORS.danger} />
-          <Text style={styles.rejectNoteText} numberOfLines={2}>{item.reviewComments}</Text>
-        </View>
-      )}
-      {item.errorCategory && (
-        <View style={styles.errorTag}>
-          <Text style={styles.errorTagText}>{item.errorCategory.replace(/_/g, ' ').toUpperCase()}</Text>
-        </View>
-      )}
-    </Card>
-  );
+
+        {item.status === 'rejected' && item.reviewComments && (
+          <Text style={styles.rejectNoteInline} numberOfLines={1}>Lý do: {item.reviewComments}</Text>
+        )}
+      </Card>
+    );
+  };
 
   if (loading) return <Screen><Loading /></Screen>;
 
@@ -102,6 +124,43 @@ export default function ReviewerHistoryScreen({ navigation }) {
           </TouchableOpacity>
         ))}
       </View>
+
+      <View style={styles.filterBarType}>
+        {[
+          { key: 'all', label: 'Tất cả', icon: 'apps-outline', color: COLORS.textSecondary },
+          { key: 'text', label: 'Text', icon: 'document-text-outline', color: '#A78BFA' },
+          { key: 'audio', label: 'Audio', icon: 'musical-notes-outline', color: '#FFB74D' },
+          { key: 'image', label: 'Image', icon: 'image-outline', color: '#4FC3F7' },
+        ].map((f) => {
+          const active = typeFilter === f.key;
+          return (
+            <TouchableOpacity
+              key={f.key}
+              style={[
+                styles.filterBtn,
+                styles.filterTypeBtn,
+                active && styles.filterBtnActive,
+                active && f.key !== 'all' && { borderColor: `${f.color}CC`, backgroundColor: `${f.color}22` },
+              ]}
+              onPress={() => setTypeFilter(f.key)}
+            >
+              <Ionicons
+                name={f.icon}
+                size={12}
+                color={active ? f.color : (f.key === 'all' ? COLORS.textSecondary : `${f.color}B3`)}
+              />
+              <Text
+                style={[
+                  styles.filterText,
+                  f.key !== 'all' && { color: active ? f.color : `${f.color}CC` },
+                ]}
+              >
+                {f.label}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
       <FlatList
         data={filtered}
         renderItem={renderTask}
@@ -134,31 +193,48 @@ const styles = StyleSheet.create({
   statDot: { width: 8, height: 8, borderRadius: 4 },
   statChipText: { fontSize: 13, fontWeight: '600' },
   filterBar: {
-    flexDirection: 'row', padding: SPACING.md, gap: SPACING.xs,
-    backgroundColor: COLORS.bgCard, borderBottomWidth: 1, borderBottomColor: COLORS.border,
+    flexDirection: 'row', paddingTop: SPACING.md, paddingHorizontal: SPACING.md, gap: SPACING.xs,
+    backgroundColor: COLORS.bgCard,
+  },
+  filterBarType: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    paddingHorizontal: SPACING.md,
+    paddingTop: SPACING.xs,
+    paddingBottom: SPACING.md,
+    gap: SPACING.xs,
+    backgroundColor: COLORS.bgCard,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.border,
   },
   filterBtn: {
-    paddingHorizontal: SPACING.lg, paddingVertical: 7,
+    paddingHorizontal: SPACING.md, paddingVertical: 6,
     borderRadius: RADIUS.full, borderWidth: 1, borderColor: COLORS.border, backgroundColor: COLORS.bgElevated,
+  },
+  filterTypeBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
   },
   filterBtnActive: { backgroundColor: COLORS.primaryGlow, borderColor: COLORS.primary },
   filterText: { fontSize: 13, fontWeight: '600', color: COLORS.textSecondary },
-  card: { marginBottom: SPACING.md },
-  cardHeader: { flexDirection: 'row', alignItems: 'flex-start', gap: SPACING.sm, marginBottom: SPACING.sm },
-  projectName: { fontSize: 15, fontWeight: '700', color: COLORS.textPrimary },
-  fileName: { fontSize: 12, color: COLORS.textSecondary, marginTop: 2 },
-  cardMeta: { flexDirection: 'row', gap: SPACING.lg, marginBottom: SPACING.sm },
-  metaItem: { flexDirection: 'row', alignItems: 'center', gap: 4 },
-  metaText: { fontSize: 11, color: COLORS.textMuted },
-  rejectNote: {
-    flexDirection: 'row', alignItems: 'flex-start', gap: SPACING.xs,
-    backgroundColor: COLORS.dangerGlow, padding: SPACING.sm, borderRadius: RADIUS.sm,
-    borderWidth: 1, borderColor: COLORS.danger + '33', marginBottom: SPACING.xs,
+  card: { marginBottom: SPACING.sm, paddingVertical: SPACING.md },
+  cardHeaderCompact: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: SPACING.sm,
   },
-  rejectNoteText: { flex: 1, fontSize: 12, color: COLORS.danger, lineHeight: 17 },
-  errorTag: {
-    alignSelf: 'flex-start', paddingHorizontal: 8, paddingVertical: 3,
-    backgroundColor: COLORS.danger + '22', borderRadius: RADIUS.full,
+  typeIconWrap: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.bgElevated,
   },
-  errorTagText: { fontSize: 10, fontWeight: '700', color: COLORS.danger },
+  projectName: { fontSize: 14, fontWeight: '700', color: COLORS.textPrimary },
+  metaLine: { fontSize: 11, color: COLORS.textMuted, marginTop: 2 },
+  rejectNoteInline: { fontSize: 11, color: COLORS.danger, marginTop: SPACING.xs },
 });

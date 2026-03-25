@@ -5,9 +5,6 @@ import { useAuth } from '../context/AuthContext';
 import { COLORS } from '../theme';
 
 import LoginScreen from '../screens/auth/LoginScreen';
-import AdminNavigator from './AdminNavigator';
-import ManagerNavigator from './ManagerNavigator';
-import AnnotatorNavigator from './AnnotatorNavigator';
 import ReviewerNavigator from './ReviewerNavigator';
 
 const Stack = createNativeStackNavigator();
@@ -31,20 +28,13 @@ export default function RootNavigator() {
     );
   }
 
-  switch (user.role) {
-    case 'admin':
-      return <AdminNavigator />;
-    case 'manager':
-      return <ManagerNavigator />;
-    case 'annotator':
-      return <AnnotatorNavigator />;
-    case 'reviewer':
-      return <ReviewerNavigator />;
-    default:
-      return (
-        <Stack.Navigator screenOptions={{ headerShown: false }}>
-          <Stack.Screen name="Login" component={LoginScreen} />
-        </Stack.Navigator>
-      );
+  if (user.role !== 'reviewer') {
+    return (
+      <Stack.Navigator screenOptions={{ headerShown: false }}>
+        <Stack.Screen name="Login" component={LoginScreen} />
+      </Stack.Navigator>
+    );
   }
+
+  return <ReviewerNavigator />;
 }

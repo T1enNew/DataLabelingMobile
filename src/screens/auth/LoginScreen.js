@@ -40,9 +40,6 @@ export default function LoginScreen() {
   };
 
   const QUICK_LOGINS = [
-    { label: 'Admin', email: 'admin@example.com', pass: 'admin123', color: COLORS.roleAdmin },
-    { label: 'Manager', email: 'manager@example.com', pass: 'manager123', color: COLORS.roleManager },
-    { label: 'Annotator', email: 'annotator1@example.com', pass: 'annotator123', color: COLORS.roleAnnotator },
     { label: 'Reviewer', email: 'reviewer1@example.com', pass: 'reviewer123', color: COLORS.roleReviewer },
   ];
 

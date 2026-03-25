@@ -1,0 +1,24 @@
+{
+  "files.exclude": {
+    "**/node_modules": true,
+    "**/.expo": true,
+    "**/.expo-shared": true
+  },
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/.expo": true,
+    "**/.expo-shared": true
+  },
+  "files.watcherExclude": {
+    "**/node_modules/**": true,
+    "**/.expo/**": true,
+    "**/.expo-shared/**": true
+  },
+  "typescript.tsserver.excludeDirectories": [
+    "**/node_modules",
+    "**/.expo"
+  ],
+  "problems.exclude": {
+    "**/node_modules/**": true
+  }
+}

@@ -1,11 +1,13 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   View, Text, StyleSheet, Alert, ScrollView, TouchableOpacity,
-  TextInput, Image, Modal, KeyboardAvoidingView, Platform
+  TextInput, Image, Modal, KeyboardAvoidingView, Platform, Dimensions
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import Svg, { Rect, Text as SvgText, Circle } from 'react-native-svg';
+import axios from 'axios';
 import { tasksAPI, reviewsAPI, BASE_URL } from '../../services/api';
+import { Audio } from 'expo-av';
 import { Screen, Header, Card, Button, Tag, Loading, StatusBadge, InfoRow } from '../../components/UI';
 import { COLORS, SPACING, RADIUS } from '../../theme';
 
@@ -18,42 +20,543 @@ const ERROR_CATEGORIES = [
 ];
 
 export default function ReviewerTaskScreen({ navigation, route }) {
-  const { taskId, mode } = route.params;
+  const { taskId, mode, annotatorIds } = route.params;
+  const allowedAnnotatorIds = useMemo(() => (
+    annotatorIds
+      ? annotatorIds.split(',').map((id) => id.trim()).filter(Boolean)
+      : null
+  ), [annotatorIds]);
   const [task, setTask] = useState(null);
   const [loading, setLoading] = useState(true);
   const [approving, setApproving] = useState(false);
+  const [projectTasks, setProjectTasks] = useState([]);
+  const [relatedTasks, setRelatedTasks] = useState([]);
+  const [annotatorVisibility, setAnnotatorVisibility] = useState({});
+  const [activeAnnotatorId, setActiveAnnotatorId] = useState('');
+  const [showAnnotatorLabels, setShowAnnotatorLabels] = useState(false);
+  const [showTextLabels, setShowTextLabels] = useState(true);
+  const [splitView, setSplitView] = useState(false);
   const [rejecting, setRejecting] = useState(false);
   const [showRejectModal, setShowRejectModal] = useState(false);
   const [rejectComment, setRejectComment] = useState('');
   const [errorCategory, setErrorCategory] = useState('other');
   const [reviewNotes, setReviewNotes] = useState([]);
   const [addingNote, setAddingNote] = useState(null); // { x, y }
+  const [selectedTextSpanNote, setSelectedTextSpanNote] = useState(null); // { annotatorName, label, text }
   const [noteText, setNoteText] = useState('');
-  const [imgSize, setImgSize] = useState({ width: 300, height: 250 });
+  const [settingPrimary, setSettingPrimary] = useState(false);
+  const [primaryQueued, setPrimaryQueued] = useState(false);
+  const [infoAnnotatorId, setInfoAnnotatorId] = useState('');
+  const SCREEN_W = Dimensions.get('window').width - SPACING.lg * 2;
+  const [imgSize, setImgSize] = useState({ width: SCREEN_W, height: 250 });
+  const [imgMeta, setImgMeta] = useState({ width: 0, height: 0 });
+  const [containerSize, setContainerSize] = useState({ width: SCREEN_W, height: 250 });
+  const [audioWaveWidth, setAudioWaveWidth] = useState(Math.max(220, SCREEN_W - 24));
+  const audioSoundRef = useRef(null);
+  const [playingSegKey, setPlayingSegKey] = useState('');
+
+  const loadTaskData = useCallback(async ({ preserveLoading = false } = {}) => {
+    if (!preserveLoading) setLoading(true);
+    try {
+      const [taskRes, relatedRes] = await Promise.all([
+        tasksAPI.getById(taskId),
+        tasksAPI.getRelated(taskId),
+      ]);
+
+      setTask(taskRes.data);
+      setPrimaryQueued(false);
+      const tasks = Array.isArray(relatedRes?.data) ? relatedRes.data : [];
+      setRelatedTasks(tasks);
+
+      const visibility = {};
+      tasks.forEach((t) => {
+        const aid = t?.annotatorId?._id || t?.annotatorId;
+        if (aid) visibility[aid] = true;
+      });
+
+      if (allowedAnnotatorIds && allowedAnnotatorIds.length > 0) {
+        Object.keys(visibility).forEach((aid) => {
+          visibility[aid] = allowedAnnotatorIds.includes(aid);
+        });
+        setAnnotatorVisibility(visibility);
+        if (allowedAnnotatorIds.length === 1) {
+          setActiveAnnotatorId(allowedAnnotatorIds[0]);
+        } else if (allowedAnnotatorIds.length > 1) {
+          setActiveAnnotatorId('');
+        }
+        setShowAnnotatorLabels(true);
+      } else {
+        setAnnotatorVisibility(visibility);
+        if (tasks.length === 1) {
+          const onlyId = tasks[0]?.annotatorId?._id || tasks[0]?.annotatorId || '';
+          setActiveAnnotatorId(onlyId);
+        }
+      }
+
+      if (!preserveLoading) setLoading(false);
+
+      const projectId = taskRes.data?.projectId?._id || taskRes.data?.projectId;
+      if (projectId) {
+        reviewsAPI.getAll().then((res) => {
+          const pending = Array.isArray(res?.data?.pending) ? res.data.pending : [];
+          const reviewed = Array.isArray(res?.data?.reviewed) ? res.data.reviewed : [];
+          const all = [...pending, ...reviewed];
+          const scoped = all.filter((t) => {
+            const pid = t?.projectId?._id || t?.projectId;
+            return pid?.toString?.() === projectId?.toString?.();
+          });
+          setProjectTasks(scoped);
+        }).catch(() => {});
+      }
+    } catch (e) {
+      if (!preserveLoading) setLoading(false);
+      Alert.alert('Error', e.message);
+    }
+  }, [taskId, allowedAnnotatorIds]);
 
   useEffect(() => {
-    tasksAPI.getById(taskId).then(res => {
-      setTask(res.data);
-    }).catch(e => Alert.alert('Error', e.message))
-      .finally(() => setLoading(false));
-  }, [taskId]);
+    loadTaskData();
+  }, [loadTaskData]);
 
-  const imageUrl = task?.dataItem?.path ? `${BASE_URL}/${task.dataItem.path}` : null;
-  const annotations = task?.labels?.objects || [];
+  const [resolvedTextContent, setResolvedTextContent] = useState('');
+
+  const buildFileUrl = (dataItem) => {
+    if (!dataItem) return '';
+    const base = BASE_URL.replace(/\/+$/, '');
+    if (dataItem.imageUrl) {
+      const cleanImageUrl = String(dataItem.imageUrl).replace(/^\/+/, '');
+      return `${base}/${cleanImageUrl}`;
+    }
+    if (dataItem.audioUrl) {
+      const cleanAudioUrl = String(dataItem.audioUrl).replace(/^\/+/, '');
+      return `${base}/${cleanAudioUrl}`;
+    }
+    const rawPath = dataItem.path || '';
+    const cleanPath = String(rawPath).replace(/^\/+/, '');
+    if (cleanPath) {
+      if (dataItem.filename && cleanPath.endsWith(dataItem.filename)) {
+        return `${base}/${cleanPath}`;
+      }
+      return dataItem.filename ? `${base}/${cleanPath}/${dataItem.filename}` : `${base}/${cleanPath}`;
+    }
+    return dataItem.filename ? `${base}/uploads/datasets/${dataItem.filename}` : '';
+  };
+
+  const imageUrl = buildFileUrl(task?.dataItem);
   const labels = task?.projectId?.labelSet || [];
+  const annotatorName = task?.annotatorId?.fullName || task?.annotatorId?.username || 'Annotator';
+
+  const mimeType = task?.dataItem?.mimeType || '';
+  const datasetType = mimeType.startsWith('image/')
+    ? 'image'
+    : mimeType.startsWith('audio/')
+      ? 'audio'
+      : (mimeType.startsWith('text/') || task?.dataItem?.text || task?.dataItem?.content)
+        ? 'text'
+        : 'image';
+
+  const stopAudioSegment = useCallback(async () => {
+    try {
+      if (audioSoundRef.current) {
+        await audioSoundRef.current.stopAsync();
+        await audioSoundRef.current.unloadAsync();
+        audioSoundRef.current = null;
+      }
+    } catch (_) {}
+    setPlayingSegKey('');
+  }, []);
+
+  const playAudioSegment = useCallback(async (segment, segKey) => {
+    if (!imageUrl || datasetType !== 'audio') return;
+
+    const start = Number(segment?.start ?? segment?.startTime ?? 0);
+    const end = Number(segment?.end ?? segment?.endTime ?? 0);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+
+    try {
+      await stopAudioSegment();
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
+      });
+
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: imageUrl },
+        { shouldPlay: false }
+      );
+      audioSoundRef.current = sound;
+      setPlayingSegKey(segKey);
+
+      const startMs = Math.max(0, Math.floor(start * 1000));
+      const endMs = Math.max(startMs + 100, Math.floor(end * 1000));
+      await sound.setPositionAsync(startMs);
+      await sound.playAsync();
+
+      setTimeout(async () => {
+        try {
+          const current = audioSoundRef.current;
+          if (current) {
+            const status = await current.getStatusAsync();
+            if (status?.isLoaded && status.positionMillis >= endMs - 120) {
+              await stopAudioSegment();
+            } else if (status?.isLoaded) {
+              await current.setPositionAsync(endMs);
+              await stopAudioSegment();
+            }
+          }
+        } catch (_) {
+          await stopAudioSegment();
+        }
+      }, Math.max(120, endMs - startMs));
+    } catch (e) {
+      setPlayingSegKey('');
+      Alert.alert('Audio error', 'Không thể phát đoạn âm thanh này.');
+    }
+  }, [datasetType, imageUrl, stopAudioSegment]);
+
+  const playFullAudio = useCallback(async () => {
+    if (!imageUrl || datasetType !== 'audio') return;
+    try {
+      await stopAudioSegment();
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
+      });
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: imageUrl },
+        { shouldPlay: true }
+      );
+      audioSoundRef.current = sound;
+      setPlayingSegKey('__full__');
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if (status?.didJustFinish) {
+          stopAudioSegment();
+        }
+      });
+    } catch (e) {
+      Alert.alert('Audio error', 'Không thể phát file audio gốc.');
+      setPlayingSegKey('');
+    }
+  }, [datasetType, imageUrl, stopAudioSegment]);
+
+  useEffect(() => {
+    return () => {
+      stopAudioSegment();
+    };
+  }, [stopAudioSegment]);
+
+  const hiddenAnnotatorIds = new Set(
+    relatedTasks
+      .filter((t) => ['approved', 'rejected'].includes(t?.status))
+      .map((t) => t?.annotatorId?._id || t?.annotatorId)
+      .filter(Boolean)
+  );
+
+  const selectableRelatedTasks = relatedTasks.length > 0
+    ? relatedTasks.filter((t) => {
+      if (['approved', 'rejected'].includes(t?.status)) return false;
+      const aid = t?.annotatorId?._id || t?.annotatorId;
+      if (aid && hiddenAnnotatorIds.has(aid)) return false;
+      if (!allowedAnnotatorIds || allowedAnnotatorIds.length === 0) return true;
+      return aid ? allowedAnnotatorIds.includes(aid) : false;
+    })
+    : [];
+
+  const visibleRelatedTasks = selectableRelatedTasks.filter((t) => {
+    const aid = t?.annotatorId?._id || t?.annotatorId;
+    return aid ? annotatorVisibility[aid] !== false : true;
+  });
+
+  const combinedAnnotations = showAnnotatorLabels
+    ? (
+      visibleRelatedTasks.length > 0
+        ? visibleRelatedTasks.flatMap((t, tIdx) => {
+          const aid = t?.annotatorId?._id || t?.annotatorId || `ann_${tIdx}`;
+          const labelSet = t?.projectId?.labelSet || labels || [];
+          const defaultColor = labelSet.find((l) => l?.name)?.color;
+          const name = t?.annotatorId?.fullName || t?.annotatorId?.username || 'Annotator';
+          return (t?.labels?.objects || []).map((obj, idx) => ({
+            id: `${aid}_${idx}`,
+            bbox: obj.bbox,
+            label: `${obj.label || 'Unknown'} • ${name}`,
+            rawLabel: obj.label,
+            annotatorId: aid,
+            color: defaultColor,
+          }));
+        })
+        : (task?.labels?.objects || []).map((obj, idx) => ({
+          id: `self_${idx}`,
+          bbox: obj.bbox,
+          label: `${obj.label || 'Unknown'} • ${annotatorName}`,
+          rawLabel: obj.label,
+          annotatorId: task?.annotatorId?._id || task?.annotatorId || 'self',
+        }))
+    )
+    : [];
+
+  const annotations = showAnnotatorLabels
+    ? combinedAnnotations
+    : (task?.labels?.objects || []);
+
+  const textAnnotatorTasks = visibleRelatedTasks.filter((t) => {
+    if (!showAnnotatorLabels) return false;
+    const aid = t?.annotatorId?._id || t?.annotatorId;
+    if (!aid) return false;
+    if (!activeAnnotatorId || activeAnnotatorId === 'all') return true;
+    return aid === activeAnnotatorId;
+  });
+
+  const textAnnotatorStats = selectableRelatedTasks
+    .map((t, tIdx) => {
+      const aid = t?.annotatorId?._id || t?.annotatorId || `ann_${tIdx}`;
+      const name = t?.annotatorId?.fullName || t?.annotatorId?.username || `Annotator ${tIdx + 1}`;
+      const spans = t?.labels?.spans || t?.labels?.sentences || [];
+      return { aid, name, count: spans.length, spans };
+    })
+    .filter((x) => !!x.aid);
+
+  const visibleTextAnnotatorStats = textAnnotatorStats.filter((a) => annotatorVisibility[a.aid] !== false);
+
+  const normalizedSpansByAnnotator = useMemo(() => {
+    const map = {};
+    visibleTextAnnotatorStats.forEach((ann) => {
+      map[ann.aid] = (ann.spans || []).map((span, idx) => ({
+        id: `${ann.aid}_${idx}`,
+        label: span?.label || 'Unknown',
+        text: span?.text || span?.sentence || '',
+        start: typeof span?.start === 'number' ? span.start : -1,
+        end: typeof span?.end === 'number' ? span.end : -1,
+      }));
+    });
+    return map;
+  }, [visibleTextAnnotatorStats]);
+
+
+  const baseTextSpans = task?.labels?.spans || task?.labels?.sentences || [];
+  const textSpans = showAnnotatorLabels
+    ? (
+      textAnnotatorTasks.length > 0
+        ? textAnnotatorTasks.flatMap((t, tIdx) => {
+          const aid = t?.annotatorId?._id || t?.annotatorId || `ann_${tIdx}`;
+          const name = t?.annotatorId?.fullName || t?.annotatorId?.username || 'Annotator';
+          const spans = t?.labels?.spans || t?.labels?.sentences || [];
+          return spans.map((span, idx) => ({
+            ...span,
+            _id: `${aid}_${idx}`,
+            annotatorId: aid,
+            annotatorName: name,
+          }));
+        })
+        : baseTextSpans
+    )
+    : baseTextSpans;
+
+  const audioAnnotatorTasks = visibleRelatedTasks.filter((t) => {
+    if (!showAnnotatorLabels) return false;
+    const aid = t?.annotatorId?._id || t?.annotatorId;
+    if (!aid) return false;
+    if (!activeAnnotatorId || activeAnnotatorId === 'all') return true;
+    return aid === activeAnnotatorId;
+  });
+
+  const audioAnnotatorStats = selectableRelatedTasks
+    .map((t, tIdx) => {
+      const aid = t?.annotatorId?._id || t?.annotatorId || `ann_${tIdx}`;
+      const name = t?.annotatorId?.fullName || t?.annotatorId?.username || `Annotator ${tIdx + 1}`;
+      const segments = t?.labels?.segments || [];
+      return { aid, name, count: segments.length, segments };
+    })
+    .filter((x) => !!x.aid);
+
+  const visibleAudioAnnotatorStats = audioAnnotatorStats.filter((a) => annotatorVisibility[a.aid] !== false);
+
+  const baseAudioSegments = task?.labels?.segments || [];
+  const audioSegments = showAnnotatorLabels
+    ? (
+      audioAnnotatorTasks.length > 0
+        ? audioAnnotatorTasks.flatMap((t, tIdx) => {
+          const aid = t?.annotatorId?._id || t?.annotatorId || `ann_${tIdx}`;
+          const name = t?.annotatorId?.fullName || t?.annotatorId?.username || 'Annotator';
+          const segments = t?.labels?.segments || [];
+          return segments.map((seg, idx) => ({
+            ...seg,
+            _id: `${aid}_${idx}`,
+            annotatorId: aid,
+            annotatorName: name,
+          }));
+        })
+        : baseAudioSegments
+    )
+    : baseAudioSegments;
+
+  const audioDuration = useMemo(() => {
+    const ends = audioSegments
+      .map((seg) => Number(seg?.end ?? seg?.endTime ?? 0))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    return ends.length > 0 ? Math.max(...ends) : 0;
+  }, [audioSegments]);
+
+  const audioWaveBars = useMemo(() => {
+    const barCount = 72;
+    const seedBase = `${task?.dataItem?.filename || ''}-${audioDuration}`;
+    let hash = 0;
+    for (let i = 0; i < seedBase.length; i += 1) {
+      hash = ((hash << 5) - hash + seedBase.charCodeAt(i)) | 0;
+    }
+    const bars = [];
+    for (let i = 0; i < barCount; i += 1) {
+      const wave = Math.abs(Math.sin((i + 1) * 0.45 + hash * 0.001));
+      const noise = Math.abs(Math.sin((i + 1) * 1.77 + hash * 0.003));
+      const amp = Math.min(1, 0.2 + wave * 0.55 + noise * 0.25);
+      bars.push(amp);
+    }
+    return bars;
+  }, [task?.dataItem?.filename, audioDuration]);
+
+  const summaryItems = datasetType === 'image'
+    ? annotations
+    : datasetType === 'text'
+      ? textSpans
+      : audioSegments;
+
+  const textContent = resolvedTextContent || task?.dataItem?.text || task?.dataItem?.content || '';
+
+  const getHighlightedTextParts = () => {
+    if (!textContent || textSpans.length === 0) {
+      return [{ type: 'plain', text: textContent || 'No text content' }];
+    }
+
+    const normalized = textSpans
+      .map((span, idx) => ({
+        idx,
+        label: span?.label || 'Unknown',
+        text: span?.text || span?.sentence || '',
+        start: typeof span?.start === 'number' ? span.start : null,
+        end: typeof span?.end === 'number' ? span.end : null,
+        annotatorName: span?.annotatorName || '',
+      }))
+      .filter((span) => !!span.text)
+      .sort((a, b) => {
+        const aStart = a.start ?? Number.MAX_SAFE_INTEGER;
+        const bStart = b.start ?? Number.MAX_SAFE_INTEGER;
+        return aStart - bStart;
+      });
+
+    const parts = [];
+    let cursor = 0;
+    const usedRanges = new Set();
+
+    normalized.forEach((span) => {
+      let start = span.start;
+      let end = span.end;
+
+      if (start === null || end === null || end <= start) {
+        const foundAt = textContent.indexOf(span.text, cursor);
+        if (foundAt === -1) return;
+        start = foundAt;
+        end = foundAt + span.text.length;
+      }
+
+      const rangeKey = `${start}-${end}-${span.label}`;
+      if (usedRanges.has(rangeKey)) return;
+      usedRanges.add(rangeKey);
+
+      if (end <= cursor) return;
+      if (start < cursor) start = cursor;
+
+      if (start > cursor) {
+        parts.push({ type: 'plain', text: textContent.slice(cursor, start) });
+      }
+
+      parts.push({
+        type: 'label',
+        text: textContent.slice(start, end),
+        label: span.label,
+        annotatorName: span.annotatorName,
+      });
+
+      cursor = Math.max(cursor, end);
+    });
+
+    if (cursor < textContent.length) {
+      parts.push({ type: 'plain', text: textContent.slice(cursor) });
+    }
+
+    return parts.length > 0 ? parts : [{ type: 'plain', text: textContent }];
+  };
+
+  const uniqueProjectItems = projectTasks.reduce((acc, t) => {
+    const key = t?.dataItem?.path || t?.dataItem?.filename || t?._id;
+    if (!key || acc.some((it) => it.key === key)) return acc;
+
+    const itemMime = t?.dataItem?.mimeType || '';
+    const itemType = itemMime.startsWith('image/')
+      ? 'image'
+      : itemMime.startsWith('audio/')
+        ? 'audio'
+        : (itemMime.startsWith('text/') || t?.dataItem?.text || t?.dataItem?.content)
+          ? 'text'
+          : 'image';
+
+    acc.push({
+      key,
+      taskId: t._id,
+      status: t.status,
+      type: itemType,
+      thumb: itemType === 'image' && t?.dataItem?.path ? `${BASE_URL}/${t.dataItem.path}` : null,
+    });
+    return acc;
+  }, []);
+
+  const selectedActionAnnotatorId = infoAnnotatorId
+    || activeAnnotatorId
+    || (allowedAnnotatorIds && allowedAnnotatorIds.length > 0 ? allowedAnnotatorIds[0] : (task?.annotatorId?._id || task?.annotatorId || ''));
+
+  const selectedActionTask = relatedTasks.find((t) => {
+    const aid = t?.annotatorId?._id || t?.annotatorId;
+    return selectedActionAnnotatorId && aid?.toString?.() === selectedActionAnnotatorId?.toString?.();
+  });
+
+  const actionTaskId = selectedActionTask?._id || taskId;
+  const selectedActionStatus = selectedActionTask?.status || task?.status;
+  const canScoreSelectedTask = selectedActionStatus === 'submitted';
+  const selectedActionAnnotatorName = selectedActionTask?.annotatorId?.fullName
+    || selectedActionTask?.annotatorId?.username
+    || task?.annotatorId?.fullName
+    || task?.annotatorId?.username
+    || 'annotator';
 
   const handleApprove = async () => {
-    Alert.alert('Approve Task', 'Mark this task as approved?', [
+    if (!canScoreSelectedTask) {
+      Alert.alert('Cannot score', `Task của ${selectedActionAnnotatorName} không ở trạng thái submitted.`);
+      return;
+    }
+
+    Alert.alert('Approve Task', `Mark task of ${selectedActionAnnotatorName} as approved?`, [
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Approve',
         onPress: async () => {
           setApproving(true);
           try {
-            await reviewsAPI.approve(taskId, { reviewNotes });
-            Alert.alert('Approved!', 'Task has been approved.', [
-              { text: 'OK', onPress: () => navigation.goBack() }
-            ]);
+            await reviewsAPI.approve(actionTaskId, { reviewNotes });
+            if (primaryQueued) {
+              try {
+                await reviewsAPI.primary(actionTaskId);
+                setTask(prev => prev ? { ...prev, primaryForItem: true } : prev);
+              } catch (e) {
+                Alert.alert('Approved', 'Task approved but failed to set primary. Please try again.');
+              }
+            }
+            setReviewNotes([]);
+            setSelectedTextSpanNote(null);
+            setNoteText('');
+            await loadTaskData({ preserveLoading: true });
+            Alert.alert('Approved!', 'Task has been approved.');
           } catch (e) {
             Alert.alert('Error', e.message);
           } finally {
@@ -65,6 +568,11 @@ export default function ReviewerTaskScreen({ navigation, route }) {
   };
 
   const handleReject = async () => {
+    if (!canScoreSelectedTask) {
+      Alert.alert('Cannot score', `Task của ${selectedActionAnnotatorName} không ở trạng thái submitted.`);
+      return;
+    }
+
     if (!rejectComment.trim()) {
       Alert.alert('Required', 'Please provide a reason for rejection.');
       return;
@@ -75,20 +583,48 @@ export default function ReviewerTaskScreen({ navigation, route }) {
     }
     setRejecting(true);
     try {
-      await reviewsAPI.reject(taskId, {
+      await reviewsAPI.reject(actionTaskId, {
         reviewComments: rejectComment.trim(),
         errorCategory,
         reviewNotes,
       });
       setShowRejectModal(false);
-      Alert.alert('Rejected', 'Task has been rejected with feedback.', [
-        { text: 'OK', onPress: () => navigation.goBack() }
-      ]);
+      setReviewNotes([]);
+      setSelectedTextSpanNote(null);
+      setNoteText('');
+      setRejectComment('');
+      await loadTaskData({ preserveLoading: true });
+      Alert.alert('Rejected', 'Task has been rejected with feedback.');
     } catch (e) {
       Alert.alert('Error', e.message);
     } finally {
       setRejecting(false);
     }
+  };
+
+  const handleSetPrimary = async () => {
+    if (!isApproved) {
+      setPrimaryQueued((prev) => !prev);
+      return;
+    }
+    Alert.alert('Set Primary', 'Set this annotator output as primary for this item?', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Set Primary',
+        onPress: async () => {
+          setSettingPrimary(true);
+          try {
+            await reviewsAPI.primary(actionTaskId);
+            setTask(prev => prev ? { ...prev, primaryForItem: true } : prev);
+            Alert.alert('Success', 'Primary image has been set.');
+          } catch (e) {
+            Alert.alert('Error', e.message);
+          } finally {
+            setSettingPrimary(false);
+          }
+        }
+      }
+    ]);
   };
 
   const handleImageTap = (evt) => {
@@ -99,7 +635,22 @@ export default function ReviewerTaskScreen({ navigation, route }) {
   };
 
   const addNote = () => {
-    if (!noteText.trim() || !addingNote) return;
+    if (!noteText.trim()) return;
+
+    if (selectedTextSpanNote) {
+      const meta = `${selectedTextSpanNote.annotatorName || 'Annotator'} • ${selectedTextSpanNote.label || 'Unknown'}`;
+      setReviewNotes(prev => [...prev, {
+        bbox: [0, 0, 0, 0],
+        comment: `[TEXT] ${meta}: ${selectedTextSpanNote.text || '—'}\n${noteText.trim()}`,
+        label: selectedTextSpanNote.label || null,
+      }]);
+      setSelectedTextSpanNote(null);
+      setNoteText('');
+      return;
+    }
+
+    if (!addingNote) return;
+
     setReviewNotes(prev => [...prev, {
       bbox: [addingNote.x - 15, addingNote.y - 15, 30, 30],
       comment: noteText.trim(),
@@ -111,10 +662,101 @@ export default function ReviewerTaskScreen({ navigation, route }) {
 
   const removeNote = (idx) => setReviewNotes(prev => prev.filter((_, i) => i !== idx));
 
+  useEffect(() => {
+    const visibleAnnotatorIds = selectableRelatedTasks
+      .map((t) => t?.annotatorId?._id || t?.annotatorId)
+      .filter((aid) => aid && annotatorVisibility[aid] !== false);
+
+    if (visibleAnnotatorIds.length === 1) {
+      setInfoAnnotatorId(visibleAnnotatorIds[0]);
+    }
+  }, [annotatorVisibility, selectableRelatedTasks]);
+
+  useEffect(() => {
+    let mounted = true;
+    const resolveTextFromFile = async () => {
+      if (!task?.dataItem) {
+        if (mounted) setResolvedTextContent('');
+        return;
+      }
+
+      const inlineText = task.dataItem.text || task.dataItem.content || '';
+      if (inlineText) {
+        if (mounted) setResolvedTextContent(String(inlineText));
+        return;
+      }
+
+      const isText = (task.dataItem.mimeType || '').startsWith('text/');
+      if (!isText) {
+        if (mounted) setResolvedTextContent('');
+        return;
+      }
+
+      try {
+        const fileUrl = buildFileUrl(task.dataItem);
+        if (!fileUrl) {
+          if (mounted) setResolvedTextContent('');
+          return;
+        }
+        const res = await axios.get(fileUrl, { responseType: 'text' });
+        if (mounted) setResolvedTextContent(typeof res.data === 'string' ? res.data : '');
+      } catch (_) {
+        if (mounted) setResolvedTextContent('');
+      }
+    };
+
+    resolveTextFromFile();
+    return () => { mounted = false; };
+  }, [task]);
+
+  const scaleBBox = (bbox) => {
+    if (!bbox || bbox.length < 4) return [0, 0, 0, 0];
+    if (!imgMeta.width || !imgMeta.height) return bbox;
+
+    const containerW = containerSize.width || imgSize.width;
+    const containerH = containerSize.height || imgSize.height;
+    const imgW = imgMeta.width;
+    const imgH = imgMeta.height;
+
+    const scale = Math.min(containerW / imgW, containerH / imgH);
+    const renderedW = imgW * scale;
+    const renderedH = imgH * scale;
+    const offsetX = (containerW - renderedW) / 2;
+    const offsetY = (containerH - renderedH) / 2;
+
+    const [a, b, c, d] = bbox;
+
+    // Web uses percent coords (x1,y1,x2,y2). Mobile annotator uses pixel (x,y,w,h).
+    // Detect percent-style and convert to rendered pixels.
+    const isPercent = [a, b, c, d].every((v) => typeof v === 'number' && v >= 0 && v <= 100);
+
+    if (isPercent) {
+      const x1 = a;
+      const y1 = b;
+      const x2 = c;
+      const y2 = d;
+      const leftPct = Math.min(x1, x2);
+      const topPct = Math.min(y1, y2);
+      const widthPct = Math.abs(x2 - x1);
+      const heightPct = Math.abs(y2 - y1);
+
+      return [
+        (leftPct / 100) * renderedW + offsetX,
+        (topPct / 100) * renderedH + offsetY,
+        (widthPct / 100) * renderedW,
+        (heightPct / 100) * renderedH,
+      ];
+    }
+
+    const [x, y, w, h] = bbox;
+    return [x * scale + offsetX, y * scale + offsetY, w * scale, h * scale];
+  };
+
   if (loading) return <Screen><Header title="Review Task" onBack={() => navigation.goBack()} /><Loading /></Screen>;
   if (!task) return <Screen><Header title="Not Found" onBack={() => navigation.goBack()} /></Screen>;
 
   const isReadOnly = mode === 'history' || !['submitted'].includes(task.status);
+  const isApproved = selectedActionStatus === 'approved';
 
   return (
     <Screen>
@@ -128,19 +770,86 @@ export default function ReviewerTaskScreen({ navigation, route }) {
         {/* Status */}
         <View style={styles.statusRow}>
           <StatusBadge status={task.status} />
-          <Text style={styles.annotatorInfo}>
-            By: {task.annotatorId?.fullName || 'Unknown'}
-          </Text>
         </View>
 
-        {/* Image with Annotations */}
-        {imageUrl && (
+        {/* Data Viewer (image/text/audio) */}
+        {datasetType === 'image' && imageUrl && (
           <View style={styles.imageSection}>
             <Text style={styles.sectionLabel}>
               IMAGE {!isReadOnly ? '(tap to add feedback note)' : ''}
             </Text>
+
+            {/* Annotator selection controls */}
+            {relatedTasks.length > 0 && (
+              <View style={styles.annotatorControls}>
+                <View style={styles.annotatorToggleRow}>
+                  <Button
+                    title={showAnnotatorLabels ? 'Hide annotator labels' : 'Show annotator labels'}
+                    onPress={() => setShowAnnotatorLabels(prev => !prev)}
+                    variant={showAnnotatorLabels ? 'secondary' : 'primary'}
+                    size="sm"
+                  />
+                  {!allowedAnnotatorIds && (
+                    <Button
+                      title="Select all"
+                      onPress={() => {
+                        const all = {};
+                        relatedTasks.forEach((t) => {
+                          const aid = t?.annotatorId?._id || t?.annotatorId;
+                          if (aid) all[aid] = true;
+                        });
+                        setAnnotatorVisibility(all);
+                        setActiveAnnotatorId('all');
+                      }}
+                      variant="ghost"
+                      size="sm"
+                    />
+                  )}
+                </View>
+
+                {showAnnotatorLabels && (
+                  <View style={styles.annotatorChips}>
+                    {relatedTasks
+                    .filter((t) => {
+                      if (['approved', 'rejected'].includes(t?.status)) return false;
+                      if (!allowedAnnotatorIds || allowedAnnotatorIds.length === 0) return true;
+                      const aid = t?.annotatorId?._id || t?.annotatorId;
+                      return aid ? allowedAnnotatorIds.includes(aid) : false;
+                    })
+                    .map((t) => {
+                      const aid = t?.annotatorId?._id || t?.annotatorId;
+                      const name = t?.annotatorId?.fullName || t?.annotatorId?.username || 'Annotator';
+                      const isOn = annotatorVisibility[aid] !== false;
+                      const isActive = activeAnnotatorId === aid;
+                      return (
+                        <TouchableOpacity
+                          key={aid}
+                          style={[
+                            styles.annotatorChip,
+                            isOn && styles.annotatorChipOn,
+                            isActive && styles.annotatorChipActive,
+                          ]}
+                          onPress={() => {
+                            setAnnotatorVisibility((prev) => ({ ...prev, [aid]: !isOn }));
+                            setActiveAnnotatorId(aid);
+                          }}
+                        >
+                          <Text style={[styles.annotatorChipText, isOn && styles.annotatorChipTextOn]}>
+                            {isOn ? 'Hide' : 'Show'} {name}
+                          </Text>
+                        </TouchableOpacity>
+                      );
+                    })}
+                  </View>
+                )}
+              </View>
+            )}
             <View
               style={[styles.imageContainer, { height: imgSize.height }]}
+              onLayout={(e) => {
+                const { width, height } = e.nativeEvent.layout;
+                if (width && height) setContainerSize({ width, height });
+              }}
               onStartShouldSetResponder={() => !isReadOnly}
               onResponderRelease={handleImageTap}
             >
@@ -152,36 +861,35 @@ export default function ReviewerTaskScreen({ navigation, route }) {
                   onLoad={(e) => {
                     const { width, height } = e.nativeEvent.source;
                     const ratio = height / width;
-                    const w = imgSize.width;
-                    setImgSize({ width: w, height: Math.min(w * ratio, 300) });
+                    setImgMeta({ width, height });
+                    setImgSize({ width: SCREEN_W, height: Math.min(SCREEN_W * ratio, 300) });
                   }}
                 />
               </TouchableOpacity>
               <Svg style={StyleSheet.absoluteFill} width="100%" height={imgSize.height}>
-                {/* Annotator bboxes */}
                 {annotations.map((ann, i) => {
-                  const labelDef = labels.find(l => l.name === ann.label);
-                  const color = labelDef?.color || COLORS.primary;
-                  const [x, y, w, h] = ann.bbox || [0, 0, 0, 0];
+                  const labelName = ann.rawLabel || ann.label;
+                  const labelDef = labels.find(l => l.name === labelName);
+                  const color = ann.color || labelDef?.color || COLORS.primary;
+                  const [x, y, w, h] = scaleBBox(ann.bbox || [0, 0, 0, 0]);
                   return (
-                    <React.Fragment key={i}>
+                    <React.Fragment key={ann.id || i}>
                       <Rect x={x} y={y} width={w} height={h} stroke={color} strokeWidth={2} fill={color + '22'} />
-                      <SvgText x={x + 4} y={y + 16} fontSize="11" fill={color} fontWeight="bold">{ann.label}</SvgText>
+                      <SvgText x={x + 4} y={y + 16} fontSize="11" fill={color} fontWeight="bold">
+                        {ann.label || labelName}
+                      </SvgText>
                     </React.Fragment>
                   );
                 })}
-                {/* Reviewer notes */}
                 {reviewNotes.map((note, i) => (
                   <Circle key={i} cx={note.bbox[0] + 15} cy={note.bbox[1] + 15} r={14} fill={COLORS.danger + 'AA'} stroke={COLORS.danger} strokeWidth={2} />
                 ))}
-                {/* Adding note indicator */}
                 {addingNote && (
                   <Circle cx={addingNote.x} cy={addingNote.y} r={14} fill={COLORS.warning + '88'} stroke={COLORS.warning} strokeWidth={2} />
                 )}
               </Svg>
             </View>
 
-            {/* Add Note Input */}
             {addingNote && (
               <View style={styles.addNoteBox}>
                 <TextInput
@@ -200,7 +908,6 @@ export default function ReviewerTaskScreen({ navigation, route }) {
               </View>
             )}
 
-            {/* Review Notes list */}
             {reviewNotes.length > 0 && (
               <View style={styles.notesList}>
                 {reviewNotes.map((note, i) => (
@@ -221,32 +928,442 @@ export default function ReviewerTaskScreen({ navigation, route }) {
           </View>
         )}
 
-        {/* Annotations Summary */}
-        <Text style={styles.sectionLabel}>ANNOTATIONS ({annotations.length})</Text>
-        {annotations.length === 0 ? (
-          <Card><Text style={styles.noData}>No annotations</Text></Card>
-        ) : (
-          <Card>
-            <View style={styles.labelsWrap}>
-              {[...new Set(annotations.map(a => a.label))].map(label => {
-                const ld = labels.find(l => l.name === label);
-                const count = annotations.filter(a => a.label === label).length;
-                return (
-                  <View key={label} style={styles.labelCountItem}>
-                    <Tag label={label} color={ld?.color} />
-                    <Text style={styles.labelCountNum}>×{count}</Text>
-                  </View>
-                );
-              })}
+        {datasetType === 'text' && (
+          <View style={styles.imageSection}>
+            <View style={styles.textHeaderRow}>
+              <Text style={styles.sectionLabel}>TEXT REVIEW</Text>
+              <View style={styles.textToolbarRow}>
+                <TouchableOpacity
+                  style={[styles.textToggleBtn, splitView && styles.textToggleBtnOn]}
+                  onPress={() => setSplitView((prev) => !prev)}
+                >
+                  <Text style={[styles.textToggleBtnText, splitView && styles.textToggleBtnTextOn]}>
+                    Split view
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.textToggleBtn, showTextLabels && styles.textToggleBtnOn]}
+                  onPress={() => setShowTextLabels((prev) => !prev)}
+                >
+                  <Text style={[styles.textToggleBtnText, showTextLabels && styles.textToggleBtnTextOn]}>
+                    {showTextLabels ? 'Hide highlights' : 'Show highlights'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
             </View>
-          </Card>
+
+            <Card style={styles.textReviewPanel}>
+              <View style={styles.textReviewPanelTop}>
+                <Button
+                  title={showAnnotatorLabels ? 'Multi-annotator: ON' : 'Multi-annotator: OFF'}
+                  onPress={() => {
+                    setShowAnnotatorLabels((prev) => {
+                      const next = !prev;
+                      if (!next) setActiveAnnotatorId('');
+                      if (next && !activeAnnotatorId) setActiveAnnotatorId('all');
+                      return next;
+                    });
+                  }}
+                  variant={showAnnotatorLabels ? 'secondary' : 'primary'}
+                  size="sm"
+                />
+
+                {showAnnotatorLabels && (
+                  <TouchableOpacity
+                    style={styles.focusAllBtn}
+                    onPress={() => setActiveAnnotatorId('all')}
+                  >
+                    <Text style={styles.focusAllBtnText}>Focus: All annotators</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+
+              {showAnnotatorLabels && textAnnotatorStats.length > 0 && (
+                <View style={styles.textAnnotatorGrid}>
+                  {textAnnotatorStats.map((a) => {
+                    const isFocused = activeAnnotatorId === a.aid;
+                    const isVisible = annotatorVisibility[a.aid] !== false;
+                    return (
+                      <TouchableOpacity
+                        key={a.aid}
+                        style={[
+                          styles.textAnnotatorCard,
+                          isVisible && styles.textAnnotatorCardOn,
+                          isFocused && styles.textAnnotatorCardFocus,
+                        ]}
+                        onPress={() => {
+                          setAnnotatorVisibility((prev) => ({ ...prev, [a.aid]: !isVisible }));
+                          setActiveAnnotatorId((prev) => (prev === a.aid ? 'all' : a.aid));
+                        }}
+                      >
+                        <Text style={[styles.textAnnotatorName, isVisible && styles.textAnnotatorNameOn]} numberOfLines={1}>{a.name}</Text>
+                        <Text style={styles.textAnnotatorMeta}>{a.count} spans</Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              )}
+            </Card>
+
+            {splitView && visibleTextAnnotatorStats.length >= 1 ? (
+              <View style={styles.splitWrap}>
+                {visibleTextAnnotatorStats.map((ann) => {
+                  const annSpans = normalizedSpansByAnnotator[ann.aid] || [];
+                  const groupedByLabel = annSpans.reduce((acc, s) => {
+                    const key = s.label || 'Unknown';
+                    if (!acc[key]) acc[key] = [];
+                    acc[key].push({ text: s.text || '—', label: key, annotatorName: ann.name });
+                    return acc;
+                  }, {});
+
+                  return (
+                    <Card key={ann.aid} style={styles.splitCard}>
+                      <Text style={styles.splitTitle}>{ann.name}</Text>
+                      {showTextLabels ? (
+                        <View style={styles.splitRows}>
+                          {Object.entries(groupedByLabel).map(([labelName, snippets]) => {
+                            const labelDef = labels.find((l) => l.name === labelName);
+                            return (
+                              <View key={`${ann.aid}_${labelName}`} style={styles.splitRowItem}>
+                                <View style={styles.splitRowHeader}>
+                                  <Tag label={labelName} color={labelDef?.color} />
+                                  <Text style={styles.splitRowCount}>{snippets.length}</Text>
+                                </View>
+                                <View style={styles.splitSnippetWrap}>
+                                  {snippets.slice(0, 4).map((item, idx) => (
+                                    <TouchableOpacity
+                                      key={`${ann.aid}_${labelName}_${idx}`}
+                                      onPress={() => {
+                                        if (isReadOnly) return;
+                                        setSelectedTextSpanNote(item);
+                                        setAddingNote(null);
+                                        setNoteText('');
+                                      }}
+                                      activeOpacity={0.8}
+                                      style={[
+                                        styles.textSpanSelectBtn,
+                                        selectedTextSpanNote?.text === item.text
+                                          && selectedTextSpanNote?.label === item.label
+                                          && selectedTextSpanNote?.annotatorName === item.annotatorName
+                                          && styles.textSpanSelectBtnActive,
+                                      ]}
+                                    >
+                                      <Text style={styles.splitSnippetText}>
+                                        • {item.text}
+                                      </Text>
+                                    </TouchableOpacity>
+                                  ))}
+                                  {snippets.length > 4 && (
+                                    <Text style={styles.splitMoreText}>+{snippets.length - 4} more</Text>
+                                  )}
+                                </View>
+                              </View>
+                            );
+                          })}
+                        </View>
+                      ) : (
+                        <Text style={styles.textBody}>{textContent || 'No text content'}</Text>
+                      )}
+                    </Card>
+                  );
+                })}
+              </View>
+            ) : (
+              <Card>
+                {showTextLabels ? (
+                  <Text style={styles.textBody}>
+                    {getHighlightedTextParts().map((part, idx) => {
+                      if (part.type === 'plain') {
+                        return <Text key={`plain-${idx}`} style={styles.textPlain}>{part.text}</Text>;
+                      }
+                      const labelDef = labels.find((l) => l.name === part.label);
+                      return (
+                        <Text
+                          key={`label-${idx}`}
+                          style={[
+                            styles.textLabelHighlight,
+                            {
+                              backgroundColor: (labelDef?.color || COLORS.primary) + '33',
+                              borderColor: (labelDef?.color || COLORS.primary) + 'AA',
+                            },
+                          ]}
+                        >
+                          {part.text}
+                        </Text>
+                      );
+                    })}
+                  </Text>
+                ) : (
+                  <Text style={styles.textBody}>{textContent || 'No text content'}</Text>
+                )}
+              </Card>
+            )}
+
+            {selectedTextSpanNote && !isReadOnly && (
+              <View style={styles.addNoteBox}>
+                <Text style={styles.textNoteContext}>
+                  Đang ghi chú cho: {selectedTextSpanNote.annotatorName} • {selectedTextSpanNote.label}
+                </Text>
+                <Text style={styles.textNoteSnippet} numberOfLines={3}>
+                  "{selectedTextSpanNote.text}"
+                </Text>
+                <TextInput
+                  style={styles.noteInput}
+                  placeholder="Feedback note for this text span..."
+                  placeholderTextColor={COLORS.textMuted}
+                  value={noteText}
+                  onChangeText={setNoteText}
+                  autoFocus
+                  multiline
+                />
+                <View style={styles.noteActions}>
+                  <Button
+                    title="Cancel"
+                    onPress={() => {
+                      setSelectedTextSpanNote(null);
+                      setNoteText('');
+                    }}
+                    variant="ghost"
+                    size="sm"
+                  />
+                  <Button title="Add Note" onPress={addNote} size="sm" />
+                </View>
+              </View>
+            )}
+
+          </View>
+        )}
+
+        {datasetType === 'audio' && (
+          <View style={styles.imageSection}>
+            <Text style={styles.sectionLabel}>AUDIO REVIEW</Text>
+            <Card>
+              <Text style={styles.audioFilename}>{task?.dataItem?.filename || 'Audio file'}</Text>
+              <Text style={styles.audioHint}>MimeType: {task?.dataItem?.mimeType || 'audio/*'}</Text>
+              <Text style={styles.audioHint}>Duration: {audioDuration > 0 ? `${audioDuration.toFixed(2)}s` : '—'}</Text>
+
+              <View style={styles.annotatorToggleRow}>
+                <Button
+                  title={showAnnotatorLabels ? 'Multi-annotator: ON' : 'Multi-annotator: OFF'}
+                  onPress={() => {
+                    setShowAnnotatorLabels((prev) => {
+                      const next = !prev;
+                      if (!next) setActiveAnnotatorId('');
+                      if (next && !activeAnnotatorId) setActiveAnnotatorId('all');
+                      return next;
+                    });
+                  }}
+                  variant={showAnnotatorLabels ? 'secondary' : 'primary'}
+                  size="sm"
+                />
+                <Button
+                  title={playingSegKey === '__full__' ? 'Playing full...' : 'Play full audio'}
+                  onPress={playFullAudio}
+                  variant="ghost"
+                  size="sm"
+                  disabled={playingSegKey === '__full__'}
+                />
+                {playingSegKey ? (
+                  <Button
+                    title="Stop"
+                    onPress={stopAudioSegment}
+                    variant="ghost"
+                    size="sm"
+                  />
+                ) : null}
+              </View>
+
+              {showAnnotatorLabels && audioAnnotatorStats.length > 0 && (
+                <View style={styles.textAnnotatorGrid}>
+                  {audioAnnotatorStats.map((a) => {
+                    const isFocused = activeAnnotatorId === a.aid;
+                    const isVisible = annotatorVisibility[a.aid] !== false;
+                    return (
+                      <TouchableOpacity
+                        key={a.aid}
+                        style={[
+                          styles.textAnnotatorCard,
+                          isVisible && styles.textAnnotatorCardOn,
+                          isFocused && styles.textAnnotatorCardFocus,
+                        ]}
+                        onPress={() => {
+                          setAnnotatorVisibility((prev) => ({ ...prev, [a.aid]: !isVisible }));
+                          setActiveAnnotatorId((prev) => (prev === a.aid ? 'all' : a.aid));
+                        }}
+                      >
+                        <Text style={[styles.textAnnotatorName, isVisible && styles.textAnnotatorNameOn]} numberOfLines={1}>{a.name}</Text>
+                        <Text style={styles.textAnnotatorMeta}>{a.count} segments</Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              )}
+
+              <View
+                style={styles.audioWaveWrap}
+                onLayout={(e) => {
+                  const { width } = e.nativeEvent.layout;
+                  if (width) setAudioWaveWidth(Math.max(220, width - 8));
+                }}
+              >
+                <Svg width={audioWaveWidth} height={120}>
+                  {audioWaveBars.map((amp, idx) => {
+                    const barW = Math.max(2, (audioWaveWidth - 16) / audioWaveBars.length - 1.5);
+                    const gap = 1.5;
+                    const x = 8 + idx * (barW + gap);
+                    const h = 14 + amp * 52;
+                    const y = 52 - h / 2;
+                    return (
+                      <Rect
+                        key={`bar-${idx}`}
+                        x={x}
+                        y={y}
+                        width={barW}
+                        height={h}
+                        rx={1.5}
+                        fill={COLORS.primary + '88'}
+                      />
+                    );
+                  })}
+
+                  {showAnnotatorLabels && audioSegments.map((seg, idx) => {
+                    if (!audioDuration || audioDuration <= 0) return null;
+                    const start = Number(seg?.start ?? seg?.startTime ?? 0);
+                    const end = Number(seg?.end ?? seg?.endTime ?? 0);
+                    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+                    const x = 8 + (start / audioDuration) * (audioWaveWidth - 16);
+                    const w = Math.max(2, ((end - start) / audioDuration) * (audioWaveWidth - 16));
+                    const labelName = seg?.label || 'Unknown';
+                    const labelDef = labels.find((l) => l.name === labelName);
+                    const baseColor = labelDef?.color || COLORS.primary;
+                    const segKey = `${seg?.annotatorId || 'base'}-${idx}-${start}-${end}-${labelName}`;
+                    const isPlaying = playingSegKey === segKey;
+                    return (
+                      <Rect
+                        key={`seg-overlay-${idx}`}
+                        x={x}
+                        y={88}
+                        width={w}
+                        height={18}
+                        rx={6}
+                        fill={isPlaying ? COLORS.statusApproved + '88' : `${baseColor}66`}
+                        stroke={isPlaying ? COLORS.statusApproved : baseColor}
+                        strokeWidth={1}
+                        onPress={() => playAudioSegment(seg, segKey)}
+                      />
+                    );
+                  })}
+                </Svg>
+              </View>
+
+              {showAnnotatorLabels && (
+                <>
+                  <Text style={styles.audioHint}>Chạm vào label bên dưới để phát đúng đoạn audio của annotator đó.</Text>
+                  <View style={styles.audioAnnotatorSection}>
+                    {visibleAudioAnnotatorStats.map((ann) => {
+                      const annSegments = ann.segments || [];
+                      return (
+                        <View key={`audio-ann-${ann.aid}`} style={styles.audioAnnotatorBlock}>
+                          <Text style={styles.audioAnnotatorName}>{ann.name}</Text>
+                          {annSegments.slice(0, 24).map((seg, idx) => {
+                            const labelName = seg?.label || 'Unknown';
+                            const labelDef = labels.find((l) => l.name === labelName);
+                            const start = Number(seg?.start ?? seg?.startTime ?? 0);
+                            const end = Number(seg?.end ?? seg?.endTime ?? 0);
+                            const segKey = `${ann.aid}-${idx}-${start}-${end}-${labelName}`;
+                            const isPlaying = playingSegKey === segKey;
+                            return (
+                              <View key={segKey} style={styles.simpleListRow}>
+                                <View style={styles.simpleListHeaderRow}>
+                                  <Text style={styles.simpleListTitle}>#{idx + 1}</Text>
+                                  <TouchableOpacity onPress={() => playAudioSegment(seg, segKey)} activeOpacity={0.8}>
+                                    <Tag label={labelName} color={isPlaying ? COLORS.statusApproved : labelDef?.color} />
+                                  </TouchableOpacity>
+                                </View>
+                                <Text style={styles.simpleListValue}>{start} - {end}</Text>
+                              </View>
+                            );
+                          })}
+                        </View>
+                      );
+                    })}
+                  </View>
+                </>
+              )}
+            </Card>
+          </View>
+        )}
+
+        {/* Annotations Summary */}
+        {datasetType === 'image' && (
+          <>
+            <Text style={styles.sectionLabel}>ANNOTATIONS ({summaryItems.length})</Text>
+            {summaryItems.length === 0 ? (
+              <Card><Text style={styles.noData}>No annotations</Text></Card>
+            ) : (
+              <Card>
+                <View style={styles.labelsWrap}>
+                  {[...new Set(annotations.map(a => a.rawLabel || a.label))].map(label => {
+                    const ld = labels.find(l => l.name === label);
+                    const count = annotations.filter(a => (a.rawLabel || a.label) === label).length;
+                    return (
+                      <View key={label} style={styles.labelCountItem}>
+                        <Tag label={label} color={ld?.color} />
+                        <Text style={styles.labelCountNum}>×{count}</Text>
+                      </View>
+                    );
+                  })}
+                </View>
+              </Card>
+            )}
+          </>
         )}
 
         {/* Task Info */}
         <Text style={styles.sectionLabel}>TASK INFO</Text>
         <Card>
-          <InfoRow icon="person-outline" label="Annotator" value={task.annotatorId?.fullName} />
-          <InfoRow icon="paper-plane-outline" label="Submitted" value={task.submittedAt ? new Date(task.submittedAt).toLocaleString() : '—'} />
+          {allowedAnnotatorIds && allowedAnnotatorIds.length > 1 ? (
+            <View>
+              <InfoRow
+                icon="people-outline"
+                label="Annotators"
+                value={`Selected (${allowedAnnotatorIds.length})`}
+              />
+              <View style={styles.annotatorChipsInline}>
+                {allowedAnnotatorIds.map((aid) => {
+                  const match = relatedTasks.find((t) => (t?.annotatorId?._id || t?.annotatorId) === aid);
+                  const name = match?.annotatorId?.fullName || match?.annotatorId?.username || aid;
+                  const isActive = infoAnnotatorId
+                    ? infoAnnotatorId === aid
+                    : (allowedAnnotatorIds.length === 1 || task.annotatorId?._id === aid || task.annotatorId === aid);
+                  return (
+                    <TouchableOpacity
+                      key={aid}
+                      style={[styles.annotatorChipInline, isActive && styles.annotatorChipInlineActive]}
+                      onPress={() => setInfoAnnotatorId(aid)}
+                      activeOpacity={0.8}
+                    >
+                      <Text style={[styles.annotatorChipInlineText, isActive && styles.annotatorChipInlineTextActive]}>{name}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            </View>
+          ) : (
+            <InfoRow icon="person-outline" label="Annotator" value={task.annotatorId?.fullName} />
+          )}
+          <InfoRow
+            icon="paper-plane-outline"
+            label="Submitted"
+            value={(() => {
+              if (allowedAnnotatorIds && allowedAnnotatorIds.length > 1) {
+                const targetId = infoAnnotatorId || allowedAnnotatorIds[0];
+                const match = relatedTasks.find((t) => (t?.annotatorId?._id || t?.annotatorId) === targetId);
+                return match?.submittedAt ? new Date(match.submittedAt).toLocaleString() : '—';
+              }
+              return task.submittedAt ? new Date(task.submittedAt).toLocaleString() : '—';
+            })()}
+          />
           {task.reviewComments && (
             <InfoRow icon="chatbubble-outline" label="Review Note" value={task.reviewComments} />
           )}
@@ -260,25 +1377,81 @@ export default function ReviewerTaskScreen({ navigation, route }) {
           </>
         )}
 
+        {/* Project Tasks Preview */}
+        {uniqueProjectItems.length > 0 && (
+          <>
+            <Text style={styles.sectionLabel}>PROJECT TASKS ({uniqueProjectItems.length})</Text>
+            <View style={styles.projectTasksRow}>
+              {uniqueProjectItems.slice(0, 12).map((item) => (
+                <TouchableOpacity
+                  key={item.key}
+                  style={styles.projectThumb}
+                  onPress={() => navigation.navigate('ReviewerTask', { taskId: item.taskId, mode: item.status === 'submitted' ? 'review' : 'history', annotatorIds })}
+                >
+                  {item.thumb ? (
+                    <Image source={{ uri: item.thumb }} style={styles.projectThumbImg} />
+                  ) : item.type === 'audio' ? (
+                    <View style={[styles.projectThumbFallback, styles.projectThumbFallbackAudio]}>
+                      <View style={[styles.projectThumbIconWrap, styles.projectThumbIconWrapAudio]}>
+                        <Ionicons name="musical-notes" size={20} color="#FFD28C" />
+                      </View>
+                    </View>
+                  ) : item.type === 'text' ? (
+                    <View style={[styles.projectThumbFallback, styles.projectThumbFallbackText]}>
+                      <View style={[styles.projectThumbIconWrap, styles.projectThumbIconWrapText]}>
+                        <Ionicons name="document-text" size={19} color="#B9C8FF" />
+                      </View>
+                    </View>
+                  ) : (
+                    <View style={[styles.projectThumbFallback, styles.projectThumbFallbackUnknown]}>
+                      <View style={styles.projectThumbIconWrap}>
+                        <Ionicons name="document-outline" size={18} color={COLORS.textMuted} />
+                      </View>
+                    </View>
+                  )}
+                </TouchableOpacity>
+              ))}
+            </View>
+          </>
+        )}
+
         {/* Action Buttons */}
         {!isReadOnly && (
-          <View style={styles.actionArea}>
+          <>
+            <Text style={styles.actionTargetHint}>Chấm điểm cho: {selectedActionAnnotatorName}</Text>
+            <View style={styles.actionArea}>
+              <Button
+                title="Approve"
+                onPress={handleApprove}
+                loading={approving}
+                variant="success"
+                icon="checkmark-circle-outline"
+                size="lg"
+                style={{ flex: 1 }}
+                disabled={!canScoreSelectedTask}
+              />
+              <Button
+                title="Reject"
+                onPress={() => setShowRejectModal(true)}
+                variant="danger"
+                icon="close-circle-outline"
+                size="lg"
+                style={{ flex: 1 }}
+                disabled={!canScoreSelectedTask}
+              />
+            </View>
+          </>
+        )}
+
+        {!isReadOnly && datasetType === 'image' && !task.primaryForItem && (
+          <View style={styles.primaryArea}>
             <Button
-              title="Approve"
-              onPress={handleApprove}
-              loading={approving}
-              variant="success"
-              icon="checkmark-circle-outline"
+              title={primaryQueued && !isApproved ? 'Primary Queued' : 'Set Primary'}
+              onPress={handleSetPrimary}
+              loading={settingPrimary}
+              variant={primaryQueued && !isApproved ? 'secondary' : 'primary'}
+              icon={primaryQueued && !isApproved ? 'star' : 'star-outline'}
               size="lg"
-              style={{ flex: 1 }}
-            />
-            <Button
-              title="Reject"
-              onPress={() => setShowRejectModal(true)}
-              variant="danger"
-              icon="close-circle-outline"
-              size="lg"
-              style={{ flex: 1 }}
             />
           </View>
         )}
@@ -325,7 +1498,7 @@ export default function ReviewerTaskScreen({ navigation, route }) {
               <View style={styles.noteWarning}>
                 <Ionicons name="warning-outline" size={16} color={COLORS.warning} />
                 <Text style={styles.noteWarningText}>
-                  Add at least one feedback note on the image before rejecting.
+                  Add at least one feedback note before rejecting (image or selected text span).
                 </Text>
               </View>
             )}
@@ -362,6 +1535,21 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.bgElevated, borderWidth: 1, borderColor: COLORS.border,
     position: 'relative',
   },
+  annotatorControls: { marginBottom: SPACING.sm },
+  annotatorToggleRow: { flexDirection: 'row', gap: SPACING.sm, marginBottom: SPACING.xs },
+  annotatorChips: { flexDirection: 'row', flexWrap: 'wrap', gap: SPACING.xs },
+  annotatorChip: {
+    paddingHorizontal: 10, paddingVertical: 6,
+    borderRadius: RADIUS.full, borderWidth: 1, borderColor: COLORS.border,
+    backgroundColor: COLORS.bgElevated,
+  },
+  annotatorChipOn: {
+    backgroundColor: COLORS.primary + '22',
+    borderColor: COLORS.primary + '66',
+  },
+  annotatorChipActive: { borderColor: COLORS.warning, borderWidth: 2 },
+  annotatorChipText: { fontSize: 11, color: COLORS.textSecondary, fontWeight: '600' },
+  annotatorChipTextOn: { color: COLORS.primary },
   addNoteBox: {
     backgroundColor: COLORS.bgCard, borderRadius: RADIUS.md, padding: SPACING.md,
     borderWidth: 1, borderColor: COLORS.warning + '55', marginTop: SPACING.sm,
@@ -389,9 +1577,72 @@ const styles = StyleSheet.create({
   labelCountNum: { fontSize: 12, fontWeight: '700', color: COLORS.textSecondary },
   noData: { fontSize: 13, color: COLORS.textMuted, textAlign: 'center', padding: SPACING.lg },
   guidelines: { fontSize: 14, color: COLORS.textSecondary, lineHeight: 22 },
-  actionArea: {
-    flexDirection: 'row', gap: SPACING.md, marginTop: SPACING.xl,
+  actionTargetHint: {
+    marginTop: SPACING.lg,
+    marginBottom: SPACING.sm,
+    fontSize: 12,
+    color: COLORS.textMuted,
+    fontWeight: '700',
   },
+  actionArea: {
+    flexDirection: 'row', gap: SPACING.md, marginTop: SPACING.xs,
+  },
+  primaryArea: { marginTop: SPACING.md },
+  projectTasksRow: { flexDirection: 'row', flexWrap: 'wrap', gap: SPACING.sm },
+  projectThumb: {
+    width: 72, height: 72,
+    borderRadius: RADIUS.sm,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.bgElevated,
+  },
+  projectThumbImg: { width: '100%', height: '100%' },
+  projectThumbFallback: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.bgElevated,
+  },
+  projectThumbFallbackAudio: {
+    backgroundColor: 'rgba(255,183,77,0.10)',
+  },
+  projectThumbFallbackText: {
+    backgroundColor: 'rgba(167,139,250,0.10)',
+  },
+  projectThumbFallbackUnknown: {
+    backgroundColor: COLORS.bgElevated,
+  },
+  projectThumbIconWrap: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.bgCard,
+  },
+  projectThumbIconWrapAudio: {
+    borderColor: 'rgba(255,183,77,0.55)',
+    backgroundColor: 'rgba(255,183,77,0.20)',
+  },
+  projectThumbIconWrapText: {
+    borderColor: 'rgba(167,139,250,0.55)',
+    backgroundColor: 'rgba(167,139,250,0.20)',
+  },
+  annotatorChipsInline: { flexDirection: 'row', flexWrap: 'wrap', gap: SPACING.xs, marginTop: SPACING.xs },
+  annotatorChipInline: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: RADIUS.full,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.bgElevated,
+  },
+  annotatorChipInlineText: { fontSize: 11, color: COLORS.textSecondary, fontWeight: '600' },
+  annotatorChipInlineActive: { borderColor: COLORS.primary, backgroundColor: COLORS.primary + '22' },
+  annotatorChipInlineTextActive: { color: COLORS.primary },
   modalOverlay: {
     flex: 1, backgroundColor: 'rgba(0,0,0,0.7)',
     justifyContent: 'flex-end',
@@ -430,4 +1681,284 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: COLORS.warning + '44', marginBottom: SPACING.md,
   },
   noteWarningText: { flex: 1, fontSize: 12, color: COLORS.warning, lineHeight: 18 },
+  textHeaderRow: {
+    flexDirection: 'column',
+    alignItems: 'flex-start',
+    justifyContent: 'flex-start',
+    marginBottom: SPACING.xs,
+    marginTop: SPACING.lg,
+    gap: SPACING.xs,
+  },
+  textToolbarRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: SPACING.xs,
+  },
+  textToggleBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: RADIUS.full,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.bgElevated,
+  },
+  textToggleBtnOn: {
+    borderColor: COLORS.primary + 'AA',
+    backgroundColor: COLORS.primary + '22',
+  },
+  textToggleBtnText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: COLORS.textSecondary,
+  },
+  textToggleBtnTextOn: {
+    color: COLORS.primary,
+  },
+  textReviewPanel: {
+    marginBottom: SPACING.sm,
+  },
+  textReviewPanelTop: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: SPACING.sm,
+    marginBottom: SPACING.sm,
+  },
+  focusAllBtn: {
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.bgElevated,
+    borderRadius: RADIUS.full,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  focusAllBtnText: {
+    fontSize: 11,
+    color: COLORS.textSecondary,
+    fontWeight: '700',
+  },
+  textAnnotatorGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: SPACING.xs,
+  },
+  textAnnotatorCard: {
+    minWidth: 120,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: RADIUS.md,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.bgElevated,
+  },
+  textAnnotatorCardOn: {
+    borderColor: COLORS.primary + '66',
+    backgroundColor: COLORS.primary + '15',
+  },
+  textAnnotatorCardFocus: {
+    borderColor: COLORS.warning,
+    borderWidth: 2,
+  },
+  textAnnotatorName: {
+    fontSize: 12,
+    color: COLORS.textSecondary,
+    fontWeight: '700',
+  },
+  textAnnotatorNameOn: {
+    color: COLORS.textPrimary,
+  },
+  textAnnotatorMeta: {
+    marginTop: 2,
+    fontSize: 11,
+    color: COLORS.textMuted,
+  },
+  splitWrap: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: SPACING.sm,
+    marginBottom: SPACING.sm,
+  },
+  splitCard: {
+    width: '100%',
+  },
+  splitTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.textSecondary,
+    marginBottom: SPACING.xs,
+  },
+  splitRows: {
+    gap: SPACING.xs,
+  },
+  splitRowItem: {
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.bgElevated,
+    borderRadius: RADIUS.sm,
+    padding: SPACING.xs,
+    gap: 6,
+  },
+  splitRowHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: SPACING.xs,
+  },
+  splitRowCount: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: COLORS.textMuted,
+  },
+  splitSnippetWrap: {
+    marginTop: 4,
+    gap: 2,
+  },
+  splitSnippetText: {
+    color: COLORS.textPrimary,
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  textSpanSelectBtn: {
+    borderRadius: RADIUS.sm,
+    paddingHorizontal: 4,
+    paddingVertical: 2,
+  },
+  textSpanSelectBtnActive: {
+    backgroundColor: COLORS.warning + '22',
+    borderWidth: 1,
+    borderColor: COLORS.warning + '66',
+  },
+  textNoteContext: {
+    fontSize: 12,
+    color: COLORS.textSecondary,
+    marginBottom: 6,
+    fontWeight: '700',
+  },
+  textNoteSnippet: {
+    fontSize: 12,
+    color: COLORS.textMuted,
+    marginBottom: SPACING.sm,
+    lineHeight: 18,
+  },
+  splitMoreText: {
+    marginTop: 2,
+    fontSize: 11,
+    color: COLORS.textMuted,
+    fontWeight: '600',
+  },
+  splitRowText: {
+    color: COLORS.textPrimary,
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  diffPanel: {
+    marginTop: SPACING.sm,
+  },
+  diffRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: SPACING.xs,
+    marginTop: 6,
+  },
+  diffDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: COLORS.textMuted,
+  },
+  diffText: {
+    flex: 1,
+    fontSize: 12,
+    color: COLORS.textSecondary,
+  },
+  emptyDiffText: {
+    marginTop: SPACING.sm,
+    fontSize: 12,
+    color: COLORS.textMuted,
+  },
+  textBody: {
+    color: COLORS.textPrimary,
+    fontSize: 14,
+    lineHeight: 22,
+  },
+  textPlain: {
+    color: COLORS.textPrimary,
+    fontSize: 14,
+    lineHeight: 22,
+  },
+  textLabelHighlight: {
+    color: COLORS.textPrimary,
+    fontSize: 14,
+    lineHeight: 22,
+    borderWidth: 1,
+    borderRadius: 4,
+    paddingHorizontal: 2,
+  },
+  textMeta: {
+    color: COLORS.textSecondary,
+    fontSize: 12,
+    marginBottom: SPACING.sm,
+  },
+  audioFilename: {
+    color: COLORS.textPrimary,
+    fontSize: 14,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
+  audioHint: {
+    color: COLORS.textMuted,
+    fontSize: 12,
+    marginBottom: 4,
+  },
+  audioWaveWrap: {
+    marginTop: SPACING.sm,
+    marginBottom: SPACING.sm,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: RADIUS.md,
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+    backgroundColor: COLORS.bgElevated,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  audioAnnotatorSection: {
+    gap: SPACING.sm,
+    marginTop: SPACING.xs,
+  },
+  audioAnnotatorBlock: {
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: RADIUS.md,
+    backgroundColor: COLORS.bgElevated,
+    padding: SPACING.sm,
+  },
+  audioAnnotatorName: {
+    color: COLORS.textPrimary,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  simpleListRow: {
+    borderTopWidth: 1,
+    borderTopColor: COLORS.border,
+    paddingTop: SPACING.sm,
+    marginTop: SPACING.sm,
+  },
+  simpleListHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 4,
+    gap: SPACING.sm,
+  },
+  simpleListTitle: {
+    color: COLORS.textPrimary,
+    fontSize: 12,
+    fontWeight: '700',
+    marginBottom: 2,
+  },
+  simpleListValue: {
+    color: COLORS.textSecondary,
+    fontSize: 12,
+  },
 });

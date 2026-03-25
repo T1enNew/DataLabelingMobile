@@ -65,6 +65,7 @@ export const projectsAPI = {
     responseType: format === 'csv' ? 'text' : 'json'
   }),
   quality: (id) => api.get(`/projects/${id}/quality`),
+  reviewDecision: (id, data) => api.post(`/projects/${id}/review-decision`, data),
 };
 
 // ─── DATASETS ───────────────────────────────────────
@@ -82,6 +83,7 @@ export const datasetsAPI = {
 export const tasksAPI = {
   myTasks: () => api.get('/tasks/my-tasks'),
   getById: (id) => api.get(`/tasks/${id}`),
+  getRelated: (id, params) => api.get(`/tasks/${id}/related`, { params }),
   assign: (data) => api.post('/tasks/assign', data),
   label: (id, data) => api.put(`/tasks/${id}/label`, data),
   submit: (id) => api.post(`/tasks/${id}/submit`),
@@ -94,6 +96,7 @@ export const reviewsAPI = {
   getAll: () => api.get('/reviews/all'),
   approve: (id, data) => api.post(`/reviews/${id}/approve`, data),
   reject: (id, data) => api.post(`/reviews/${id}/reject`, data),
+  primary: (id) => api.post(`/reviews/${id}/primary`),
   stats: () => api.get('/reviews/stats'),
 };
 
