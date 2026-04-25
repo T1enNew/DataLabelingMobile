@@ -1,859 +1,730 @@
-import React, { useState, useEffect, useCallback } from 'react';
+/**
+ * ReviewerQueueScreen
+ * ─────────────────────
+ * Màn hình queue hiển thị danh sách PROJECT cần review.
+ * Workflow: Queue → Chọn Project → Project Detail → Chọn Subtopic → Task List → Review Task
+ *
+ * Mỗi project card gồm:
+ * - project name, topic name, số subtopic, total tasks, pending/approved/rejected, approval rate, status
+ * - nút "Xem chi tiết" → ReviewerProjectDetailScreen
+ *
+ * Filter: status, data type, topic
+ * KHÔNG có nút Approve/Reject project trong màn queue.
+ */
+
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { useFocusEffect } from '@react-navigation/native';
 import {
-  View, Text, FlatList, StyleSheet, TouchableOpacity, RefreshControl, TextInput, Alert
+  View, Text, FlatList, StyleSheet, RefreshControl, TouchableOpacity,
+  TextInput, ScrollView, Modal, KeyboardAvoidingView, Platform
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { reviewsAPI, projectsAPI } from '../../services/api';
-import { Screen, Card, Loading, EmptyState } from '../../components/UI';
+import { LinearGradient } from 'expo-linear-gradient';
+import { reviewerAPI, tasksAPI } from '../../services/api';
+import { Screen, Card, EmptyState, Loading } from '../../components/UI';
 import { COLORS, SPACING, RADIUS } from '../../theme';
 
-const PROJECT_APPROVE_THRESHOLD = 0.7;
-const PROJECT_REJECT_THRESHOLD = 0.3;
+// ─── Status Config ───────────────────────────────────────────────────────────
+const PROJECT_STATUS = {
+  pending:       { color: COLORS.warning,          label: 'Pending',        icon: 'time-outline' },
+  in_review:     { color: COLORS.primary,          label: 'In Review',     icon: 'eye-outline' },
+  active:        { color: COLORS.info,             label: 'Active',         icon: 'play-circle-outline' },
+  waiting_rework:{ color: COLORS.info,             label: 'Rework',        icon: 'refresh-outline' },
+  completed:     { color: COLORS.accent,           label: 'Completed',     icon: 'checkmark-done-outline' },
+  approved:      { color: COLORS.accent,           label: 'Approved',      icon: 'checkmark-circle-outline' },
+  rejected:      { color: COLORS.danger,           label: 'Rejected',      icon: 'close-circle-outline' },
+  expired:       { color: COLORS.textMuted,        label: 'Expired',       icon: 'alert-circle-outline' },
+  overdue:       { color: COLORS.danger,           label: 'Qua han',      icon: 'alert-circle-outline' },
+};
 
+// ─── Status Helper (mirrors web ProjectList.jsx getProjectStatus) ────────────
+// Kiểm tra deadline dựa trên stats và deadline thực tế của project
+// Web gốc kiểm tra deadline SAU khi xét hết các điều kiện reviewed/pending/rejected
+function getProjectStatus(stats, deadline) {
+  const overdue = deadline && new Date(deadline) < new Date();
+  const total = stats?.total || 0;
+  const reviewed = stats?.reviewed || 0;
+  const pending = stats?.pending || 0;
+  const rejected = stats?.rejected || 0;
+
+  if (!stats || total === 0) return PROJECT_STATUS.pending;
+  if (reviewed === total) {
+    if (rejected === total) {
+      return { color: COLORS.danger, label: 'Da reject het', icon: 'close-circle-outline' };
+    }
+    return PROJECT_STATUS.completed;
+  }
+  if (rejected > 0) return { color: COLORS.warning, label: 'Cho annotator sua lai', icon: 'refresh-outline' };
+  if (pending > 0) return { color: COLORS.primary, label: 'Dang review', icon: 'eye-outline' };
+  if (overdue) return PROJECT_STATUS.overdue;
+  return { color: COLORS.primary, label: 'Dang review', icon: 'eye-outline' };
+}
+
+// ─── Filter Options ───────────────────────────────────────────────────────────
+const STATUS_FILTER_OPTIONS = [
+  { key: 'all',          label: 'Tất cả' },
+  { key: 'pending',      label: 'Cần review' },
+  { key: 'reviewed',     label: 'Đã xong' },
+  { key: 'has_rejected', label: 'Bị reject' },
+  { key: 'overdue',      label: 'Qua hạn' },
+];
+
+const DATA_TYPE_OPTIONS = [
+  { key: 'all',   label: 'Tất cả loại', icon: 'apps-outline' },
+  { key: 'image', label: 'Image',        icon: 'image-outline', color: '#4FC3F7' },
+  { key: 'text',  label: 'Text',         icon: 'document-text-outline', color: '#A78BFA' },
+  { key: 'audio', label: 'Audio',        icon: 'musical-notes-outline', color: '#FFB74D' },
+];
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function calcApprovalRate(approved, total) {
+  if (!total || total === 0) return 0;
+  return Math.round((approved / total) * 100);
+}
+
+function getDataTypeIcon(mimeType) {
+  if (!mimeType) return { icon: 'document-outline', color: COLORS.textMuted, bg: COLORS.bgElevated, border: COLORS.border };
+  if (mimeType.startsWith('image/')) return { icon: 'image', color: '#4FC3F7', bg: 'rgba(79,195,247,0.15)', border: 'rgba(79,195,247,0.40)' };
+  if (mimeType.startsWith('text/')) return { icon: 'document-text', color: '#A78BFA', bg: 'rgba(167,139,250,0.15)', border: 'rgba(167,139,250,0.40)' };
+  if (mimeType.startsWith('audio/')) return { icon: 'musical-notes', color: '#FFB74D', bg: 'rgba(255,183,77,0.15)', border: 'rgba(255,183,77,0.40)' };
+  return { icon: 'document-outline', color: COLORS.textMuted, bg: COLORS.bgElevated, border: COLORS.border };
+}
+
+// ─── Project Card ────────────────────────────────────────────────────────────
+function ProjectCard({ project, onPress }) {
+  // Use getProjectStatus like web (checks deadline against stats, not project.status field)
+  const projectStats = {
+    total: project.totalTasks || 0,
+    pending: project.pendingReview || 0,
+    reviewed: project.reviewed || 0,
+    approved: project.approved || 0,
+    rejected: project.rejected || 0,
+  };
+  const statusCfg = getProjectStatus(projectStats, project.deadline);
+  const approvalRate = calcApprovalRate(project.approved || 0, project.totalTasks || 0);
+  const dataTypeIcon = getDataTypeIcon(project.dataType);
+  const subtopicCount = project.subtopicCount || 0;
+
+  // Progress bar
+  const total = project.totalTasks || 1;
+  const pendingPct  = ((project.pendingReview || 0) / total) * 100;
+  const approvedPct = ((project.approved || 0) / total) * 100;
+  const rejectedPct = ((project.rejected || 0) / total) * 100;
+
+  return (
+    <Card
+      style={styles.projectCard}
+      onPress={onPress}
+    >
+      {/* Header row */}
+      <View style={styles.cardHeader}>
+        <View style={styles.cardTitleRow}>
+          <View style={[styles.typeBadge, { backgroundColor: dataTypeIcon.bg, borderColor: dataTypeIcon.border }]}>
+            <Ionicons name={dataTypeIcon.icon} size={14} color={dataTypeIcon.color} />
+          </View>
+          <Text style={styles.projectName} numberOfLines={1}>{project.name || 'Untitled Project'}</Text>
+        </View>
+        <View style={[styles.statusBadge, { backgroundColor: statusCfg.color + '22', borderColor: statusCfg.color + '66' }]}>
+          <Ionicons name={statusCfg.icon} size={11} color={statusCfg.color} />
+          <Text style={[styles.statusBadgeText, { color: statusCfg.color }]}>{statusCfg.label}</Text>
+        </View>
+      </View>
+
+      {/* Topic */}
+      <View style={styles.metaRow}>
+        <Ionicons name="layers-outline" size={12} color={COLORS.textMuted} />
+        <Text style={styles.metaText} numberOfLines={1}>
+          {project.topicName || '—'} • {subtopicCount} subtopic{subtopicCount !== 1 ? 's' : ''}
+        </Text>
+      </View>
+
+      {/* Progress bar */}
+      <View style={styles.progressBarWrap}>
+        <View style={styles.progressBar}>
+          <View style={[styles.progressApproved,  { width: `${approvedPct}%` }]} />
+          <View style={[styles.progressRejected,  { width: `${rejectedPct}%` }]} />
+          <View style={[styles.progressPending,   { width: `${pendingPct}%` }]} />
+        </View>
+      </View>
+
+      {/* Stats row */}
+      <View style={styles.statsRow}>
+        <View style={styles.statItem}>
+          <Text style={styles.statNum}>{project.pendingReview || 0}</Text>
+          <Text style={styles.statLabel}>Pending</Text>
+        </View>
+        <View style={styles.statDivider} />
+        <View style={styles.statItem}>
+          <Text style={[styles.statNum, { color: COLORS.accent }]}>{project.approved || 0}</Text>
+          <Text style={styles.statLabel}>Approved</Text>
+        </View>
+        <View style={styles.statDivider} />
+        <View style={styles.statItem}>
+          <Text style={[styles.statNum, { color: COLORS.danger }]}>{project.rejected || 0}</Text>
+          <Text style={styles.statLabel}>Rejected</Text>
+        </View>
+        <View style={styles.statDivider} />
+        <View style={styles.statItem}>
+          <Text style={[styles.statNum, { color: approvalRate >= 70 ? COLORS.accent : approvalRate >= 50 ? COLORS.warning : COLORS.danger }]}>
+            {approvalRate}%
+          </Text>
+          <Text style={styles.statLabel}>Rate</Text>
+        </View>
+        <View style={styles.statDivider} />
+        <View style={styles.statItem}>
+          <Text style={styles.statNum}>{project.totalTasks || 0}</Text>
+          <Text style={styles.statLabel}>Total</Text>
+        </View>
+      </View>
+
+      {/* Action */}
+      <TouchableOpacity style={styles.detailBtn} onPress={onPress} activeOpacity={0.8}>
+        <Text style={styles.detailBtnText}>Xem chi tiết</Text>
+        <Ionicons name="chevron-forward" size={16} color={COLORS.primary} />
+      </TouchableOpacity>
+    </Card>
+  );
+}
+
+// ─── Filter Modal ─────────────────────────────────────────────────────────────
+function FilterModal({ visible, onClose, filters, onApply }) {
+  const [local, setLocal] = useState(filters);
+
+  const toggleStatus = (key) => {
+    if (key === 'all') {
+      setLocal(prev => ({ ...prev, status: 'all' }));
+    } else {
+      setLocal(prev => ({
+        ...prev,
+        status: prev.status === key ? 'all' : key,
+      }));
+    }
+  };
+
+  const toggleDataType = (key) => {
+    setLocal(prev => ({ ...prev, dataType: prev.dataType === key ? 'all' : key }));
+  };
+
+  return (
+    <Modal visible={visible} transparent animationType="slide">
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.filterModalOverlay}>
+        <View style={styles.filterModal}>
+          <View style={styles.filterModalHeader}>
+            <Text style={styles.filterModalTitle}>Bộ lọc</Text>
+            <TouchableOpacity onPress={onClose}>
+              <Ionicons name="close" size={22} color={COLORS.textSecondary} />
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView showsVerticalScrollIndicator={false}>
+            {/* Status Filter */}
+            <Text style={styles.filterSectionLabel}>TRẠNG THÁI</Text>
+            <View style={styles.filterChips}>
+              {STATUS_FILTER_OPTIONS.map(opt => {
+                const active = local.status === opt.key;
+                return (
+                  <TouchableOpacity
+                    key={opt.key}
+                    style={[styles.filterChip, active && styles.filterChipActive]}
+                    onPress={() => toggleStatus(opt.key)}
+                  >
+                    <Text style={[styles.filterChipText, active && styles.filterChipTextActive]}>{opt.label}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
+            {/* Data Type Filter */}
+            <Text style={styles.filterSectionLabel}>LOẠI DỮ LIỆU</Text>
+            <View style={styles.filterChips}>
+              {DATA_TYPE_OPTIONS.map(opt => {
+                const active = local.dataType === opt.key;
+                const color = opt.color || COLORS.textSecondary;
+                return (
+                  <TouchableOpacity
+                    key={opt.key}
+                    style={[styles.filterChip, active && styles.filterChipActive, active && { borderColor: `${color}88`, backgroundColor: `${color}15` }]}
+                    onPress={() => toggleDataType(opt.key)}
+                  >
+                    <Ionicons name={opt.icon} size={12} color={active ? color : COLORS.textMuted} />
+                    <Text style={[styles.filterChipText, active && { color }]}>{opt.label}</Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+          </ScrollView>
+
+          {/* Actions */}
+          <View style={styles.filterActions}>
+            <TouchableOpacity
+              style={styles.filterResetBtn}
+              onPress={() => setLocal({ status: 'all', dataType: 'all', topic: '', search: '' })}
+            >
+              <Text style={styles.filterResetText}>Đặt lại</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.filterApplyBtn}
+              onPress={() => { onApply(local); onClose(); }}
+            >
+              <Text style={styles.filterApplyText}>Áp dụng</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
+  );
+}
+
+// ─── Main Screen ──────────────────────────────────────────────────────────────
 export default function ReviewerQueueScreen({ navigation }) {
-  const [tasks, setTasks] = useState([]);
+  const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [selectedProjectId, setSelectedProjectId] = useState(null);
-  const [selectedAnnotatorIdsByProject, setSelectedAnnotatorIdsByProject] = useState({});
-  const [searchQuery, setSearchQuery] = useState('');
-  const [selectedBucketFilter, setSelectedBucketFilter] = useState('all');
-  const [selectedTypeFilter, setSelectedTypeFilter] = useState('all');
-  const [reviewedTasks, setReviewedTasks] = useState([]);
-  const [projectMeta, setProjectMeta] = useState({});
-  const [projectActionLoading, setProjectActionLoading] = useState({});
+  const [searchText, setSearchText] = useState('');
+  const [filters, setFilters] = useState({ status: 'all', dataType: 'all', topic: '' });
+  const [showFilterModal, setShowFilterModal] = useState(false);
+  const [activeFiltersCount, setActiveFiltersCount] = useState(0);
 
-  const loadTasks = useCallback(async () => {
+  const loadProjects = useCallback(async () => {
     try {
-      const [pendingRes, reviewedRes, projectsRes] = await Promise.all([
-        reviewsAPI.getPending(),
-        reviewsAPI.getReviewed(),
-        projectsAPI.getAll(),
+      const [queueRes, statsRes] = await Promise.all([
+        reviewerAPI.getQueue(),
+        reviewerAPI.getAllStats().catch(() => ({ data: { stats: [] } })),
       ]);
-      setTasks(pendingRes.data || []);
-      setReviewedTasks(reviewedRes.data || []);
-      const metaMap = {};
-      (projectsRes.data || []).forEach((p) => {
-        metaMap[p._id] = p;
+
+      const raw = Array.isArray(queueRes.data) ? queueRes.data : (queueRes.data?.projects || []);
+      const statsArr = Array.isArray(statsRes.data?.stats) ? statsRes.data.stats : [];
+
+      const statsMap = {};
+      statsArr.forEach(s => { statsMap[s.projectId] = s; });
+
+      // Batch-fetch subtopics and task metadata for every project in parallel
+      const projectIds = raw.map(p => p._id);
+      const [subtopicResults, taskResults] = await Promise.allSettled([
+        Promise.all(projectIds.map(id => reviewerAPI.getSubtopics(id).then(r => ({ id, subs: r.data || [] })).catch(() => ({ id, subs: [] })))),
+        Promise.all(projectIds.map(id => tasksAPI.getRelated(id).then(r => ({ id, tasks: r.data || [] })).catch(() => ({ id, tasks: [] })))),
+      ]);
+
+      const subtopicMap = {};
+      (subtopicResults.status === 'fulfilled' ? subtopicResults.value : []).forEach(({ id, subs }) => { subtopicMap[id] = subs; });
+
+      const taskMetaMap = {};
+      (taskResults.status === 'fulfilled' ? taskResults.value : []).forEach(({ id, tasks }) => {
+        const first = Array.isArray(tasks) && tasks.length > 0 ? tasks[0] : null;
+        taskMetaMap[id] = {
+          topicName: first?.topicId?.name || first?.topicName || '—',
+          datasetName: first?.datasetId?.name || first?.datasetName || '—',
+          dataType: first?.dataType || first?.datasetId?.dataType || '',
+        };
       });
-      setProjectMeta(metaMap);
+
+      const mapped = raw.map(p => {
+        const st = statsMap[p._id] || p.stats || {};
+        const subs = subtopicMap[p._id] || [];
+        const meta = taskMetaMap[p._id] || {};
+        return {
+          _id: p._id,
+          name: p.name,
+          status: p.status,
+          topicId: p.topicId?._id || p.topicId,
+          topicName: meta.topicName || '—',
+          datasetName: meta.datasetName || '—',
+          deadline: p.deadline,
+          totalTasks: st.total || 0,
+          pendingReview: st.pending || 0,
+          reviewed: st.reviewed || 0,
+          approved: st.approved || 0,
+          rejected: st.rejected || 0,
+          subtopicCount: subs.length,
+          dataType: meta.dataType || p.dataType || '',
+          guidelines: p.guidelines,
+        };
+      });
+      setProjects(mapped);
     } catch (e) {
-      console.error(e);
+      console.error('Load projects error:', e);
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
   }, []);
 
+  useFocusEffect(useCallback(() => { loadProjects(); }, [loadProjects]));
+
   useEffect(() => {
-    const unsub = navigation.addListener('focus', loadTasks);
-    return unsub;
-  }, [navigation, loadTasks]);
+    const count = (filters.status !== 'all' ? 1 : 0) + (filters.dataType !== 'all' ? 1 : 0) + (filters.topic ? 1 : 0);
+    setActiveFiltersCount(count);
+  }, [filters]);
 
-  const groupedProjects = [...tasks, ...reviewedTasks].reduce((acc, task) => {
-    const projectId = task.projectId?._id || 'unknown';
-    if (!acc[projectId]) {
-      acc[projectId] = {
-        project: task.projectId || { _id: 'unknown', name: 'Unknown Project' },
-        annotators: {},
-      };
-    }
-    const annotatorId = task.annotatorId?._id || 'unknown';
-    if (!acc[projectId].annotators[annotatorId]) {
-      acc[projectId].annotators[annotatorId] = {
-        annotator: task.annotatorId || { _id: 'unknown', fullName: 'Unknown' },
-        tasks: [],
-      };
-    }
-    acc[projectId].annotators[annotatorId].tasks.push(task);
-    return acc;
-  }, {});
+  // Filtered list — mirrors web ProjectList.jsx filter logic
+  const filtered = useMemo(() => {
+    let list = projects;
 
-  const groupedReviewedProjects = reviewedTasks.reduce((acc, task) => {
-    const projectId = task.projectId?._id || 'unknown';
-    if (!acc[projectId]) {
-      acc[projectId] = {
-        project: task.projectId || { _id: 'unknown', name: 'Unknown Project' },
-        annotators: {},
-      };
-    }
-    const annotatorId = task.annotatorId?._id || 'unknown';
-    if (!acc[projectId].annotators[annotatorId]) {
-      acc[projectId].annotators[annotatorId] = {
-        annotator: task.annotatorId || { _id: 'unknown', fullName: 'Unknown' },
-        tasks: [],
-      };
-    }
-    acc[projectId].annotators[annotatorId].tasks.push(task);
-    return acc;
-  }, {});
-
-  const projectList = Object.values(groupedProjects);
-
-  const normalizedQuery = searchQuery.trim().toLowerCase();
-  const filteredProjectList = projectList
-    .map((proj) => {
-      const projectName = (proj.project?.name || '').toLowerCase();
-      const projectMatched = projectName.includes(normalizedQuery);
-      const annotators = Object.values(proj.annotators)
-        .filter((ag) => {
-          if (!normalizedQuery) return true;
-          if (projectMatched) return true;
-          const name = (ag.annotator?.fullName || ag.annotator?.username || '').toLowerCase();
-          return name.includes(normalizedQuery);
-        })
-        .reduce((acc, ag) => {
-          acc[ag.annotator._id || 'unknown'] = ag;
-          return acc;
-        }, {});
-      const projectType = detectProjectType({ ...proj, annotators });
-      return { ...proj, annotators, projectType };
-    })
-    .filter((proj) => Object.keys(proj.annotators).length > 0)
-    .filter((proj) => selectedTypeFilter === 'all' || proj.projectType === selectedTypeFilter);
-
-  const getProjectBucket = (proj) => {
-    const pid = proj?.project?._id;
-    const meta = projectMeta[pid];
-    const decision = meta?.projectReview?.status;
-    if (decision === 'approved' || decision === 'rejected') return 'finalized';
-
-    const deadlineRaw = meta?.deadline || proj?.project?.deadline;
-    if (deadlineRaw) {
-      const deadline = new Date(deadlineRaw);
-      if (!Number.isNaN(deadline.getTime()) && deadline.getTime() < Date.now()) {
-        return 'overdue';
-      }
-    }
-    return 'active';
-  };
-
-  function detectProjectType(proj) {
-    const pid = proj?.project?._id;
-    const meta = projectMeta[pid] || {};
-    const mimeCandidates = [
-      meta?.datasetType,
-      meta?.type,
-      meta?.dataType,
-      meta?.mimeType,
-      proj?.project?.datasetType,
-      proj?.project?.type,
-      proj?.project?.dataType,
-      ...Object.values(proj?.annotators || {}).flatMap((ag) =>
-        (ag?.tasks || []).map((t) => t?.dataItem?.mimeType || t?.dataItem?.type || '')
-      ),
-    ]
-      .filter(Boolean)
-      .map((v) => String(v).toLowerCase());
-
-    if (mimeCandidates.some((v) => v.includes('image'))) return 'image';
-    if (mimeCandidates.some((v) => v.includes('audio'))) return 'audio';
-    if (mimeCandidates.some((v) => v.includes('text') || v.includes('nlp'))) return 'text';
-    return 'unknown';
-  }
-
-  const getTypeMeta = (type) => {
-    switch (type) {
-      case 'image':
-        return { label: 'IMAGE', color: '#4FC3F7', icon: 'image-outline' };
-      case 'text':
-        return { label: 'TEXT', color: '#A78BFA', icon: 'document-text-outline' };
-      case 'audio':
-        return { label: 'AUDIO', color: '#FFB74D', icon: 'musical-notes-outline' };
-      default:
-        return { label: 'UNKNOWN', color: COLORS.textMuted, icon: 'help-circle-outline' };
-    }
-  };
-
-  const groupedByBucket = filteredProjectList.reduce((acc, proj) => {
-    const bucket = getProjectBucket(proj);
-    acc[bucket].push(proj);
-    return acc;
-  }, { overdue: [], active: [], finalized: [] });
-
-  const sectionedProjectList = [
-    {
-      key: 'active',
-      title: `Còn hạn (${groupedByBucket.active.length})`,
-      color: '#00E6A0',
-      data: groupedByBucket.active,
-    },
-    {
-      key: 'finalized',
-      title: `Đã approve/reject (${groupedByBucket.finalized.length})`,
-      color: COLORS.primary,
-      data: groupedByBucket.finalized,
-    },
-    {
-      key: 'overdue',
-      title: `Quá hạn (${groupedByBucket.overdue.length})`,
-      color: COLORS.danger,
-      data: groupedByBucket.overdue,
-    },
-  ];
-
-  const visibleSections = selectedBucketFilter === 'all'
-    ? sectionedProjectList
-    : sectionedProjectList.filter((section) => section.key === selectedBucketFilter);
-
-  const listData = visibleSections.flatMap((section) => {
-    if (section.data.length === 0) return [];
-    return [
-      { type: 'section', key: `section-${section.key}`, title: section.title, color: section.color },
-      ...section.data.map((proj) => ({
-        type: 'project',
-        key: `project-${proj.project._id}`,
-        bucket: section.key,
-        item: proj,
-      })),
-    ];
-  });
-
-
-  const renderAnnotator = (annotatorGroup) => {
-    const isOverdue = annotatorGroup.isOverdue;
-    const isSelected = annotatorGroup.selectedSet?.has(annotatorGroup.annotator._id);
-    const pendingTasks = (annotatorGroup.tasks || []).filter((t) => t.status === 'submitted');
-    const reviewCount = pendingTasks.length;
-    const reviewedCount = annotatorGroup.reviewedTasks?.length || 0;
-    const totalCount = reviewCount + reviewedCount;
-
-    const handleOpenReview = () => {
-      if (isOverdue) {
-        Alert.alert('Project quá hạn', 'Project đã quá hạn nên không thể mở task để review.');
-        return;
-      }
-      if (reviewCount === 0) return;
-      const firstTask = pendingTasks
-        .sort((a, b) => new Date(a.submittedAt || a.createdAt) - new Date(b.submittedAt || b.createdAt))[0];
-      if (!firstTask) return;
-      navigation.navigate('ReviewerTask', {
-        taskId: firstTask._id,
-        mode: 'review',
-        annotatorIds: annotatorGroup.annotator._id,
-      });
-    };
-
-    const handleOpenHistory = () => {
-      if (reviewedCount === 0) return;
-      const firstTask = annotatorGroup.reviewedTasks
-        .sort((a, b) => new Date(b.reviewedAt || b.updatedAt || b.createdAt) - new Date(a.reviewedAt || a.updatedAt || a.createdAt))[0];
-      if (!firstTask) return;
-      navigation.navigate('ReviewerTask', {
-        taskId: firstTask._id,
-        mode: 'history',
-        annotatorIds: annotatorGroup.annotator._id,
-      });
-    };
-
-    return (
-      <View key={annotatorGroup.annotator._id} style={styles.annotatorCard}>
-        <View style={styles.annotatorRow}>
-          <TouchableOpacity
-            style={[styles.selectCircle, isSelected && styles.selectCircleOn]}
-            onPress={() => annotatorGroup.onToggle?.(annotatorGroup.annotator._id)}
-          >
-            {isSelected && <Ionicons name="checkmark" size={14} color={COLORS.white} />}
-          </TouchableOpacity>
-          <Text style={styles.annotatorName}>{annotatorGroup.annotator.fullName || 'Unknown'}</Text>
-          <View style={[styles.statusPill, reviewCount > 0 ? styles.statusPending : styles.statusDone]}>
-            <Text style={styles.statusText}>
-              {reviewCount > 0 ? 'ĐANG CHỜ REVIEW' : 'ĐÃ REVIEW XONG'}
-            </Text>
-          </View>
-        </View>
-
-        <View style={styles.annotatorStatsRow}>
-          <Text style={styles.statItem}>Tổng item: {totalCount}</Text>
-          <Text style={styles.statItem}>Chờ review: {reviewCount}</Text>
-          <Text style={styles.statItem}>Đã review: {reviewedCount}</Text>
-        </View>
-
-        <View style={styles.annotatorActions}>
-          <TouchableOpacity
-            style={[styles.actionBtn, reviewCount === 0 && styles.actionBtnDisabled]}
-            onPress={handleOpenReview}
-            disabled={reviewCount === 0}
-          >
-            <Text style={styles.actionBtnText}>Mở task chờ review</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.actionBtn, reviewedCount === 0 && styles.actionBtnDisabled]}
-            onPress={handleOpenHistory}
-            disabled={reviewedCount === 0}
-          >
-            <Text style={styles.actionBtnText}>Xem lại review</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-    );
-  };
-
-  const renderProject = (item, bucket) => {
-    const isOpen = selectedProjectId === item.project._id;
-    const typeMeta = getTypeMeta(item.projectType);
-    const annotatorList = Object.values(item.annotators).map((ag) => {
-      const reviewedProjectGroup = groupedReviewedProjects[item.project._id];
-      const reviewedForAnnotator = reviewedProjectGroup?.annotators?.[ag.annotator._id]?.tasks || [];
-      return { ...ag, reviewedTasks: reviewedForAnnotator };
-    });
-    const selectedSet = selectedAnnotatorIdsByProject[item.project._id] || new Set();
-    const selectedIds = Array.from(selectedSet);
-    const projectInfo = projectMeta[item.project._id];
-    const snapshot = projectInfo?.projectReviewSnapshot;
-    const projectDecision = projectInfo?.projectReview?.status;
-    const decisionLabel = projectDecision === 'approved'
-      ? 'APPROVE'
-      : projectDecision === 'rejected'
-        ? 'REJECT'
-        : 'APPROVE/REJECT';
-    const actionableLeft = snapshot?.actionableLeft ?? null;
-    const canFinalize = actionableLeft === 0;
-
-    const reviewedForProject = reviewedTasks.filter((t) => {
-      const pid = t?.projectId?._id || t?.projectId;
-      return pid?.toString?.() === item.project._id?.toString?.();
-    });
-    const approvedCount = reviewedForProject.filter((t) => t.status === 'approved').length;
-    const rejectedCount = reviewedForProject.filter((t) => t.status === 'rejected').length;
-    const totalReviewed = reviewedForProject.length;
-    const approvedRate = totalReviewed > 0 ? approvedCount / totalReviewed : 0;
-    const rejectedRate = totalReviewed > 0 ? rejectedCount / totalReviewed : 0;
-    const approveEligible = approvedRate >= PROJECT_APPROVE_THRESHOLD;
-    const rejectEligible = rejectedRate >= PROJECT_REJECT_THRESHOLD;
-    const recommendStatus = totalReviewed === 0
-      ? 'pending'
-      : approveEligible
-        ? 'approved'
-        : rejectEligible
-          ? 'rejected'
-          : 'review';
-
-    const toggleAnnotator = (annotatorId) => {
-      setSelectedAnnotatorIdsByProject((prev) => {
-        const next = { ...prev };
-        const current = new Set(next[item.project._id] || []);
-        if (current.has(annotatorId)) {
-          current.delete(annotatorId);
-        } else {
-          current.add(annotatorId);
-        }
-        next[item.project._id] = current;
-        return next;
-      });
-    };
-
-    const selectAllAnnotators = () => {
-      const allIds = annotatorList.map(a => a.annotator._id).filter(Boolean);
-      setSelectedAnnotatorIdsByProject((prev) => ({
-        ...prev,
-        [item.project._id]: new Set(allIds),
-      }));
-    };
-
-    const clearAllAnnotators = () => {
-      setSelectedAnnotatorIdsByProject((prev) => ({
-        ...prev,
-        [item.project._id]: new Set(),
-      }));
-    };
-
-    const openSelectedTasks = () => {
-      if (bucket === 'overdue') {
-        Alert.alert('Project quá hạn', 'Project đã quá hạn nên không thể mở task để review.');
-        return;
-      }
-      if (selectedIds.length === 0) return;
-      const firstTask = annotatorList
-        .filter(a => selectedSet.has(a.annotator._id))
-        .flatMap(a => a.tasks)
-        .sort((a, b) => new Date(a.submittedAt || a.createdAt) - new Date(b.submittedAt || b.createdAt))[0];
-
-      if (!firstTask) return;
-
-      navigation.navigate('ReviewerTask', {
-        taskId: firstTask._id,
-        mode: 'review',
-        annotatorIds: selectedIds.join(','),
-      });
-    };
-
-    const handleProjectDecision = async (status) => {
-      if (!projectInfo?._id) return;
-      if (!canFinalize) {
-        Alert.alert('Not ready', 'Project still has pending/submitted tasks.');
-        return;
-      }
-      if (status === 'approved' && !approveEligible) {
-        Alert.alert('Not enough votes', 'Chưa đủ tỷ lệ đồng thuận để duyệt project.');
-        return;
-      }
-      if (status === 'rejected' && !rejectEligible) {
-        Alert.alert('Not enough votes', 'Chưa đủ tỷ lệ đồng thuận để từ chối project.');
-        return;
-      }
-      setProjectActionLoading((prev) => ({ ...prev, [projectInfo._id]: status }));
-      try {
-        await projectsAPI.reviewDecision(projectInfo._id, { status });
-        await loadTasks();
-        Alert.alert('Success', `Project marked as ${status}.`);
-      } catch (e) {
-        Alert.alert('Error', e.message);
-      } finally {
-        setProjectActionLoading((prev) => ({ ...prev, [projectInfo._id]: null }));
-      }
-    };
-
-    return (
-      <Card style={styles.projectCard}>
-        <TouchableOpacity
-          style={styles.projectHeader}
-          onPress={() => {
-            setSelectedProjectId(isOpen ? null : item.project._id);
-          }}
-          activeOpacity={0.8}
-        >
-          <View style={styles.projectHeaderLeft}>
-            <View style={styles.projectTitleRow}>
-              <Text style={styles.projectName} numberOfLines={1}>{item.project.name}</Text>
-              <View
-                style={[
-                  styles.projectStateBadge,
-                  bucket === 'active' && styles.projectStateActive,
-                  bucket === 'finalized' && styles.projectStateFinalized,
-                  bucket === 'overdue' && styles.projectStateOverdue,
-                ]}
-              >
-                <Text
-                  style={[
-                    styles.projectStateBadgeText,
-                    bucket === 'active' && styles.projectStateBadgeTextActive,
-                    bucket === 'finalized' && styles.projectStateBadgeTextFinalized,
-                    bucket === 'overdue' && styles.projectStateBadgeTextOverdue,
-                  ]}
-                >
-                  {bucket === 'active' ? 'CÒN HẠN' : bucket === 'finalized' ? decisionLabel : 'QUÁ HẠN'}
-                </Text>
-              </View>
-            </View>
-            <View style={styles.projectMetaRow}>
-              <Text style={styles.projectMeta}>Annotators: {annotatorList.length} • Tasks: {annotatorList.reduce((sum, a) => sum + a.tasks.length, 0)}</Text>
-              <View style={[styles.typeBadge, { borderColor: typeMeta.color + '88', backgroundColor: typeMeta.color + '22' }] }>
-                <Ionicons name={typeMeta.icon} size={12} color={typeMeta.color} />
-                <Text style={[styles.typeBadgeText, { color: typeMeta.color }]}>{typeMeta.label}</Text>
-              </View>
-            </View>
-          </View>
-          <Ionicons name={isOpen ? 'chevron-up' : 'chevron-down'} size={18} color={COLORS.textMuted} />
-        </TouchableOpacity>
-        {isOpen && (
-          <View style={styles.projectBody}>
-            <View style={styles.projectDecisionBar}>
-              <TouchableOpacity
-                style={[styles.projectDecisionBtn, styles.projectDecisionApprove, (!canFinalize || !approveEligible) && styles.projectDecisionDisabled]}
-                onPress={() => handleProjectDecision('approved')}
-                disabled={!canFinalize || !approveEligible || projectActionLoading[item.project._id]}
-              >
-                <Text style={styles.projectDecisionText}>
-                  {projectActionLoading[item.project._id] === 'approved' ? 'Approving...' : 'Approve project'}
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.projectDecisionBtn, styles.projectDecisionReject, (!canFinalize || !rejectEligible) && styles.projectDecisionDisabled]}
-                onPress={() => handleProjectDecision('rejected')}
-                disabled={!canFinalize || !rejectEligible || projectActionLoading[item.project._id]}
-              >
-                <Text style={styles.projectDecisionText}>
-                  {projectActionLoading[item.project._id] === 'rejected' ? 'Rejecting...' : 'Reject project'}
-                </Text>
-              </TouchableOpacity>
-              {projectDecision && (
-                <View style={styles.projectDecisionStatus}>
-                  <Text style={styles.projectDecisionStatusText}>{projectDecision.toUpperCase()}</Text>
-                </View>
-              )}
-            </View>
-            {actionableLeft !== null && !canFinalize && (
-              <Text style={styles.projectDecisionHint}>
-                Còn {actionableLeft} task chưa xong, chưa thể duyệt project.
-              </Text>
-            )}
-            {canFinalize && (
-              <Text style={styles.projectDecisionHint}>
-                Khuyến nghị: {recommendStatus.toUpperCase()} • Approved {(approvedRate * 100).toFixed(1)}% • Rejected {(rejectedRate * 100).toFixed(1)}%
-              </Text>
-            )}
-            {canFinalize && !approveEligible && (
-              <Text style={styles.projectDecisionHint}>
-                Chưa đủ tỷ lệ đồng thuận để duyệt project.
-              </Text>
-            )}
-            {canFinalize && !rejectEligible && (
-              <Text style={styles.projectDecisionHint}>
-                Chưa đủ tỷ lệ đồng thuận để từ chối project.
-              </Text>
-            )}
-            <View style={styles.multiSelectBar}>
-              <TouchableOpacity style={styles.multiSelectBtn} onPress={selectAllAnnotators}>
-                <Text style={styles.multiSelectText}>Select all</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.multiSelectBtn} onPress={clearAllAnnotators}>
-                <Text style={styles.multiSelectText}>Clear</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.multiSelectBtn, (selectedIds.length === 0 || bucket === 'overdue') && styles.multiSelectBtnDisabled]}
-                onPress={openSelectedTasks}
-                disabled={selectedIds.length === 0 || bucket === 'overdue'}
-              >
-                <Text style={styles.multiSelectText}>Open selected ({selectedIds.length})</Text>
-              </TouchableOpacity>
-            </View>
-            {annotatorList.map((group) => renderAnnotator({ ...group, onToggle: toggleAnnotator, selectedSet, isOverdue: bucket === 'overdue' }))}
-          </View>
-        )}
-      </Card>
-    );
-  };
-
-  const renderListItem = ({ item }) => {
-    if (item.type === 'section') {
-      return (
-        <View style={styles.sectionHeader}>
-          <View style={[styles.sectionDot, { backgroundColor: item.color }]} />
-          <Text style={[styles.sectionHeaderText, { color: item.color }]}>{item.title}</Text>
-        </View>
+    // Search
+    if (searchText.trim()) {
+      const q = searchText.toLowerCase();
+      list = list.filter(p =>
+        (p.name || '').toLowerCase().includes(q) ||
+        (p.topicName || '').toLowerCase().includes(q)
       );
     }
-    return renderProject(item.item, item.bucket);
-  };
+
+    // Status filter using deadline-aware getProjectStatus
+    if (filters.status !== 'all') {
+      list = list.filter(p => {
+        const ps = {
+          total: p.totalTasks || 0,
+          pending: p.pendingReview || 0,
+          reviewed: p.reviewed || 0,
+          approved: p.approved || 0,
+          rejected: p.rejected || 0,
+        };
+        const overdue = p.deadline && new Date(p.deadline) < new Date();
+
+        if (filters.status === 'pending') return ps.pending > 0;
+        if (filters.status === 'reviewed') return ps.reviewed === ps.total && ps.total > 0;
+        if (filters.status === 'has_rejected') return ps.rejected > 0;
+        if (filters.status === 'overdue') return overdue;
+        return true;
+      });
+    }
+
+    // Data type
+    if (filters.dataType !== 'all') {
+      list = list.filter(p => (p.dataType || '').startsWith(filters.dataType));
+    }
+
+    // Topic
+    if (filters.topic) {
+      list = list.filter(p => p.topicId === filters.topic);
+    }
+
+    return list;
+  }, [projects, searchText, filters]);
+
+  // Summary stats — mirrors web
+  const summary = useMemo(() => {
+    let pending = 0, approved = 0, rejected = 0, overdueCount = 0;
+    projects.forEach(p => {
+      const isOverdue = p.deadline && new Date(p.deadline) < new Date();
+      const ps = { total: p.totalTasks || 0, pending: p.pendingReview || 0, reviewed: p.reviewed || 0, approved: p.approved || 0, rejected: p.rejected || 0 };
+      const st = getProjectStatus(ps, p.deadline);
+      if (ps.pending > 0) pending++;
+      if (st.label === 'Da review xong' || st.label === 'Completed') approved++;
+      if (ps.rejected > 0) rejected++;
+      if (isOverdue) overdueCount++;
+    });
+    return { total: projects.length, pending, approved, rejected, overdue: overdueCount };
+  }, [projects]);
+
+  // Filter tab counts — mirrors web counts
+  const filterCounts = useMemo(() => {
+    const counts = { all: projects.length, pending: 0, reviewed: 0, has_rejected: 0, overdue: 0 };
+    projects.forEach(p => {
+      const isOverdue = p.deadline && new Date(p.deadline) < new Date();
+      const ps = { total: p.totalTasks || 0, pending: p.pendingReview || 0, reviewed: p.reviewed || 0, approved: p.approved || 0, rejected: p.rejected || 0 };
+      if (ps.pending > 0) counts.pending++;
+      if (ps.reviewed === ps.total && ps.total > 0) counts.reviewed++;
+      if (ps.rejected > 0) counts.has_rejected++;
+      if (isOverdue) counts.overdue++;
+    });
+    return counts;
+  }, [projects]);
+
+  const renderProject = useCallback(({ item }) => (
+    <ProjectCard
+      project={item}
+      onPress={() => navigation.navigate('ReviewerProjectDetail', { projectId: item._id })}
+    />
+  ), [navigation]);
 
   if (loading) return <Screen><Loading /></Screen>;
 
-  return (
+    return (
     <Screen>
-      <View style={styles.headerArea}>
-        <Text style={styles.screenTitle}>Review Queue</Text>
-        <View style={styles.countBadge}>
-          <Text style={styles.countText}>{tasks.length}</Text>
+      {/* ── Header ── */}
+      <LinearGradient colors={[COLORS.bgCard, COLORS.bg]} style={styles.header}>
+        <View style={styles.headerTop}>
+          <Text style={styles.screenTitle}>Review Queue</Text>
+          <TouchableOpacity
+            style={[styles.filterToggle, activeFiltersCount > 0 && styles.filterToggleActive]}
+            onPress={() => setShowFilterModal(true)}
+          >
+            <Ionicons name="filter" size={18} color={activeFiltersCount > 0 ? COLORS.primary : COLORS.textSecondary} />
+            {activeFiltersCount > 0 && (
+              <View style={styles.filterBadge}>
+                <Text style={styles.filterBadgeText}>{activeFiltersCount}</Text>
+          </View>
+            )}
+          </TouchableOpacity>
         </View>
-      </View>
 
+        {/* Summary chips */}
+        <View style={styles.summaryChips}>
+          <View style={styles.summaryChip}>
+            <Text style={styles.summaryChipNum}>{summary.total}</Text>
+            <Text style={styles.summaryChipLabel}>Projects</Text>
+              </View>
+          <View style={styles.summaryChipDivider} />
+          <View style={styles.summaryChip}>
+            <Text style={[styles.summaryChipNum, { color: COLORS.warning }]}>{summary.pending}</Text>
+            <Text style={styles.summaryChipLabel}>Cần review</Text>
+            </View>
+          <View style={styles.summaryChipDivider} />
+          <View style={styles.summaryChip}>
+            <Text style={[styles.summaryChipNum, { color: COLORS.accent }]}>{summary.approved}</Text>
+            <Text style={styles.summaryChipLabel}>Đã duyệt</Text>
+          </View>
+          <View style={styles.summaryChipDivider} />
+          <View style={styles.summaryChip}>
+            <Text style={[styles.summaryChipNum, { color: COLORS.danger }]}>{summary.rejected}</Text>
+            <Text style={styles.summaryChipLabel}>Từ chối</Text>
+          </View>
+        </View>
+
+        {/* Search bar */}
       <View style={styles.searchBar}>
         <Ionicons name="search" size={16} color={COLORS.textMuted} />
         <TextInput
           style={styles.searchInput}
-          placeholder="Search annotator..."
+            placeholder="Tìm project..."
           placeholderTextColor={COLORS.textMuted}
-          value={searchQuery}
-          onChangeText={setSearchQuery}
+            value={searchText}
+            onChangeText={setSearchText}
         />
-        {searchQuery.length > 0 && (
-          <TouchableOpacity onPress={() => setSearchQuery('')}>
+          {searchText.length > 0 && (
+            <TouchableOpacity onPress={() => setSearchText('')}>
             <Ionicons name="close-circle" size={16} color={COLORS.textMuted} />
           </TouchableOpacity>
         )}
       </View>
 
-      <View style={styles.filterPanel}>
-        <View style={styles.filterGroup}>
-          <Text style={styles.filterGroupLabel}>Trạng thái</Text>
-          <View style={styles.filterRow}>
+        {/* Filter tabs */}
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.filterTabsScroll} contentContainerStyle={styles.filterTabsContent}>
+          {STATUS_FILTER_OPTIONS.map(tab => (
             <TouchableOpacity
-              style={[styles.filterChip, styles.filterChipCompact, selectedBucketFilter === 'all' && styles.filterChipSelected]}
-              onPress={() => setSelectedBucketFilter('all')}
-            >
-              <Text style={[styles.filterChipText, selectedBucketFilter === 'all' && styles.filterChipTextActive]}>Tất cả</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
+              key={tab.key}
               style={[
-                styles.filterChip,
-                styles.filterChipCompact,
-                selectedBucketFilter === 'active' && styles.filterChipSelected,
-                selectedBucketFilter === 'active' && styles.filterChipActiveSelected,
+                styles.filterTab,
+                filters.status === tab.key && styles.filterTabActive,
               ]}
-              onPress={() => setSelectedBucketFilter('active')}
+              onPress={() => setFilters(prev => ({ ...prev, status: tab.key }))}
             >
-              <Text style={[styles.filterChipText, selectedBucketFilter === 'active' && styles.filterChipTextSuccess]}>Còn hạn</Text>
+              <Text style={[
+                styles.filterTabText,
+                filters.status === tab.key && styles.filterTabTextActive,
+              ]}>
+                {tab.label}
+              </Text>
+              <View style={[
+                styles.filterTabBadge,
+                filters.status === tab.key && styles.filterTabBadgeActive,
+              ]}>
+                <Text style={[
+                  styles.filterTabBadgeText,
+                  filters.status === tab.key && styles.filterTabBadgeTextActive,
+                ]}>
+                  {filterCounts[tab.key] || 0}
+                </Text>
+              </View>
             </TouchableOpacity>
-            <TouchableOpacity
-              style={[
-                styles.filterChip,
-                styles.filterChipCompact,
-                selectedBucketFilter === 'finalized' && styles.filterChipSelected,
-                selectedBucketFilter === 'finalized' && styles.filterChipFinalizedSelected,
-              ]}
-              onPress={() => setSelectedBucketFilter('finalized')}
-            >
-              <Text style={[styles.filterChipText, selectedBucketFilter === 'finalized' && styles.filterChipTextFinalized]}>Đã duyệt</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[
-                styles.filterChip,
-                styles.filterChipCompact,
-                selectedBucketFilter === 'overdue' && styles.filterChipSelected,
-                selectedBucketFilter === 'overdue' && styles.filterChipOverdueSelected,
-              ]}
-              onPress={() => setSelectedBucketFilter('overdue')}
-            >
-              <Text style={[styles.filterChipText, selectedBucketFilter === 'overdue' && styles.filterChipTextOverdue]}>Quá hạn</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
+          ))}
+        </ScrollView>
+      </LinearGradient>
 
-        <View style={styles.filterGroup}>
-          <Text style={styles.filterGroupLabel}>Loại dữ liệu</Text>
-          <View style={styles.filterRow}>
-            {[
-              { key: 'all', label: 'Tất cả', icon: 'apps-outline', color: COLORS.textSecondary },
-              { key: 'image', label: 'Image', icon: 'image-outline', color: '#4FC3F7' },
-              { key: 'text', label: 'Text', icon: 'document-text-outline', color: '#A78BFA' },
-              { key: 'audio', label: 'Audio', icon: 'musical-notes-outline', color: '#FFB74D' },
-            ].map((f) => {
-              const active = selectedTypeFilter === f.key;
-              const iconColor = active ? f.color : (f.key === 'all' ? COLORS.textSecondary : `${f.color}99`);
-              return (
-                <TouchableOpacity
-                  key={f.key}
-                  style={[
-                    styles.filterChip,
-                    styles.filterChipCompact,
-                    active && styles.filterChipSelected,
-                    active && f.key !== 'all' && { borderColor: `${f.color}CC`, backgroundColor: `${f.color}22` },
-                  ]}
-                  onPress={() => setSelectedTypeFilter(f.key)}
-                >
-                  <Ionicons name={f.icon} size={12} color={iconColor} />
-                  <Text
-                    style={[
-                      styles.filterChipText,
-                      active && styles.filterChipTextActive,
-                      f.key !== 'all' && { color: active ? f.color : `${f.color}CC` },
-                    ]}
-                  >
-                    {f.label}
-                  </Text>
-                </TouchableOpacity>
-              );
-            })}
-          </View>
-        </View>
-      </View>
-
+      {/* ── Project List ── */}
       <FlatList
-        data={listData}
-        renderItem={renderListItem}
-        keyExtractor={item => item.key}
-        contentContainerStyle={{ padding: SPACING.lg, paddingBottom: 100 }}
+        data={filtered}
+        renderItem={renderProject}
+        keyExtractor={item => item._id}
+        contentContainerStyle={styles.listContent}
         refreshControl={
-          <RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); loadTasks(); }} tintColor={COLORS.primary} />
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={() => { setRefreshing(true); loadProjects(); }}
+            tintColor={COLORS.primary}
+          />
         }
         ListEmptyComponent={
           <EmptyState
-            icon="checkmark-done-circle-outline"
-            title="Queue is empty"
-            message="All tasks have been reviewed. Great work!"
+            icon="folder-open-outline"
+            title="Không có project"
+            message="Không có project nào phù hợp với bộ lọc hiện tại."
           />
         }
         showsVerticalScrollIndicator={false}
+      />
+
+      {/* ── Filter Modal (for data type) ── */}
+      <FilterModal
+        visible={showFilterModal}
+        onClose={() => setShowFilterModal(false)}
+        filters={filters}
+        onApply={setFilters}
       />
     </Screen>
   );
 }
 
+// ─── Styles ───────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
-  headerArea: {
-    flexDirection: 'row', alignItems: 'center', gap: SPACING.md,
-    paddingHorizontal: SPACING.lg, paddingTop: 52, paddingBottom: SPACING.md,
-    backgroundColor: COLORS.bgCard, borderBottomWidth: 1, borderBottomColor: COLORS.border,
+  header: {
+    paddingTop: 52, paddingBottom: SPACING.md,
+    borderBottomWidth: 1, borderBottomColor: COLORS.border,
+  },
+  headerTop: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: SPACING.lg, marginBottom: SPACING.md,
   },
   screenTitle: { fontSize: 22, fontWeight: '800', color: COLORS.textPrimary },
-  countBadge: {
-    backgroundColor: COLORS.warning + '33', paddingHorizontal: 12, paddingVertical: 4,
-    borderRadius: RADIUS.full, borderWidth: 1, borderColor: COLORS.warning + '55',
+  filterToggle: {
+    width: 40, height: 40, borderRadius: 20,
+    alignItems: 'center', justifyContent: 'center',
+    borderWidth: 1, borderColor: COLORS.border,
+    backgroundColor: COLORS.bgElevated,
   },
-  countText: { fontSize: 14, fontWeight: '800', color: COLORS.warning },
+  filterToggleActive: {
+    borderColor: COLORS.primary + '66',
+    backgroundColor: COLORS.primaryGlow,
+  },
+  filterBadge: {
+    position: 'absolute', top: -4, right: -4,
+    width: 18, height: 18, borderRadius: 9,
+    backgroundColor: COLORS.primary, alignItems: 'center', justifyContent: 'center',
+  },
+  filterBadgeText: { fontSize: 10, fontWeight: '800', color: COLORS.white },
+  summaryChips: {
+    flexDirection: 'row', alignItems: 'center',
+    paddingHorizontal: SPACING.lg, marginBottom: SPACING.md,
+    gap: 0,
+  },
+  summaryChip: { alignItems: 'center', paddingHorizontal: SPACING.sm },
+  summaryChipNum: { fontSize: 18, fontWeight: '800', color: COLORS.textPrimary },
+  summaryChipLabel: { fontSize: 10, color: COLORS.textMuted, fontWeight: '600', marginTop: 2 },
+  summaryChipDivider: { width: 1, height: 28, backgroundColor: COLORS.border },
   searchBar: {
     flexDirection: 'row', alignItems: 'center', gap: SPACING.sm,
-    marginHorizontal: SPACING.lg, marginTop: SPACING.md,
-    paddingHorizontal: SPACING.md, paddingVertical: SPACING.sm,
-    backgroundColor: COLORS.bgCard, borderRadius: RADIUS.full,
-    borderWidth: 1, borderColor: COLORS.border,
-  },
-  searchInput: { flex: 1, color: COLORS.textPrimary, fontSize: 13 },
-  filterPanel: {
     marginHorizontal: SPACING.lg,
-    marginTop: SPACING.sm,
-    marginBottom: SPACING.sm,
-    gap: SPACING.sm,
+    backgroundColor: COLORS.bgElevated, borderRadius: RADIUS.md,
+    borderWidth: 1, borderColor: COLORS.border,
+    paddingHorizontal: SPACING.md, paddingVertical: 10,
   },
-  filterGroup: {
-    gap: 6,
-  },
-  filterGroupLabel: {
-    fontSize: 11,
-    color: COLORS.textMuted,
-    fontWeight: '700',
-    letterSpacing: 0.3,
-  },
-  filterRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: SPACING.xs,
-  },
-  filterChip: {
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: RADIUS.full,
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    backgroundColor: COLORS.bgCard,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  filterChipCompact: {
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-  },
-  filterChipSelected: {
-    borderColor: COLORS.textPrimary,
+  searchInput: { flex: 1, fontSize: 14, color: COLORS.textPrimary },
+  filterTabsScroll: { marginTop: SPACING.sm },
+  filterTabsContent: { paddingHorizontal: SPACING.lg, gap: SPACING.xs, flexDirection: 'row' },
+  filterTab: {
+    flexDirection: 'row', alignItems: 'center', gap: 6,
+    paddingHorizontal: SPACING.md, paddingVertical: 6,
+    borderRadius: RADIUS.full, borderWidth: 1, borderColor: COLORS.border,
     backgroundColor: COLORS.bgElevated,
+    marginRight: SPACING.xs,
   },
-  filterChipText: { fontSize: 12, fontWeight: '700', color: COLORS.textMuted },
-  filterChipTextActive: { color: COLORS.textPrimary },
-  filterChipActiveSelected: { borderColor: '#00C389', backgroundColor: 'rgba(0,195,137,0.16)' },
-  filterChipFinalizedSelected: { borderColor: COLORS.primary + 'AA', backgroundColor: COLORS.primary + '22' },
-  filterChipOverdueSelected: { borderColor: COLORS.danger + 'AA', backgroundColor: COLORS.danger + '22' },
-  filterChipTextSuccess: { color: '#00E6A0' },
-  filterChipTextFinalized: { color: '#7EB0FF' },
-  filterChipTextOverdue: { color: '#FF6B77' },
-  sectionHeader: {
-    marginBottom: SPACING.sm,
-    marginTop: SPACING.md,
-    paddingHorizontal: SPACING.xs,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: SPACING.xs,
+  filterTabActive: {
+    backgroundColor: COLORS.primaryGlow, borderColor: COLORS.primary + '88',
   },
-  sectionDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
+  filterTabText: { fontSize: 12, fontWeight: '600', color: COLORS.textSecondary },
+  filterTabTextActive: { color: COLORS.primary },
+  filterTabBadge: {
+    backgroundColor: COLORS.bgElevated, borderRadius: 10,
+    paddingHorizontal: 6, paddingVertical: 1,
   },
-  sectionHeaderText: {
-    fontSize: 12,
-    fontWeight: '800',
-    letterSpacing: 0.8,
-    textTransform: 'uppercase',
-  },
-  projectCard: { marginBottom: SPACING.md, padding: 0 },
-  projectHeader: {
+  filterTabBadgeActive: { backgroundColor: COLORS.primary + '22' },
+  filterTabBadgeText: { fontSize: 10, fontWeight: '700', color: COLORS.textMuted },
+  filterTabBadgeTextActive: { color: COLORS.primary },
+  listContent: { padding: SPACING.lg, paddingBottom: 120 },
+
+  // Project Card
+  projectCard: { marginBottom: SPACING.md, padding: SPACING.lg },
+  cardHeader: {
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    padding: SPACING.lg,
-  },
-  projectHeaderLeft: { flex: 1, marginRight: SPACING.md },
-  projectTitleRow: { flexDirection: 'row', alignItems: 'center', gap: SPACING.sm, marginBottom: 3 },
-  projectName: { flex: 1, fontSize: 16, fontWeight: '700', color: COLORS.textPrimary },
-  projectStateBadge: {
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: RADIUS.full,
-    borderWidth: 1,
-  },
-  projectStateActive: { backgroundColor: COLORS.success + '22', borderColor: COLORS.success + '88' },
-  projectStateFinalized: { backgroundColor: COLORS.primary + '22', borderColor: COLORS.primary + '88' },
-  projectStateOverdue: { backgroundColor: COLORS.danger + '22', borderColor: COLORS.danger + '88' },
-  projectStateBadgeText: { fontSize: 9, fontWeight: '800', color: COLORS.white, letterSpacing: 0.5 },
-  projectStateBadgeTextActive: { color: '#00E6A0' },
-  projectStateBadgeTextFinalized: { color: '#7EB0FF' },
-  projectStateBadgeTextOverdue: { color: '#FF6B77' },
-  projectMetaRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: SPACING.sm,
-  },
-  projectMeta: { fontSize: 12, color: COLORS.textMuted, flex: 1 },
-  typeBadge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    borderRadius: RADIUS.full,
-    borderWidth: 1,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-  },
-  typeBadgeText: {
-    fontSize: 10,
-    fontWeight: '800',
-    letterSpacing: 0.4,
-  },
-  projectBody: { paddingHorizontal: SPACING.lg, paddingBottom: SPACING.lg },
-  annotatorCard: {
-    backgroundColor: COLORS.bgElevated,
-    borderRadius: RADIUS.md,
-    borderWidth: 1,
-    borderColor: COLORS.border,
     marginBottom: SPACING.sm,
-    padding: SPACING.md,
   },
-  annotatorRow: { flexDirection: 'row', alignItems: 'center', gap: SPACING.sm },
-  annotatorStatsRow: { marginTop: SPACING.sm, gap: 6 },
-  annotatorActions: { flexDirection: 'row', gap: SPACING.sm, marginTop: SPACING.md },
-  actionBtn: {
-    flex: 1,
-    paddingVertical: SPACING.sm,
-    borderRadius: RADIUS.full,
-    backgroundColor: COLORS.primary,
-    alignItems: 'center',
-  },
-  actionBtnDisabled: { opacity: 0.5 },
-  actionBtnText: { color: COLORS.white, fontWeight: '700', fontSize: 12 },
-  statusPill: {
-    marginLeft: 'auto',
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: RADIUS.full,
-  },
-  statusPending: { backgroundColor: COLORS.warning, borderWidth: 1, borderColor: COLORS.warning + '88' },
-  statusDone: { backgroundColor: COLORS.success, borderWidth: 1, borderColor: COLORS.success + '88' },
-  statusText: { fontSize: 10, fontWeight: '800', color: COLORS.white, letterSpacing: 0.5 },
-  statItem: { fontSize: 11, color: COLORS.textMuted },
-  annotatorName: { fontSize: 13, fontWeight: '600', color: COLORS.textPrimary },
-  projectDecisionBar: { flexDirection: 'row', flexWrap: 'wrap', gap: SPACING.sm, marginBottom: SPACING.sm },
-  projectDecisionBtn: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: RADIUS.full,
-    alignItems: 'center',
-  },
-  projectDecisionApprove: { backgroundColor: COLORS.success },
-  projectDecisionReject: { backgroundColor: COLORS.danger },
-  projectDecisionDisabled: { opacity: 0.5 },
-  projectDecisionText: { color: COLORS.white, fontWeight: '700', fontSize: 12 },
-  projectDecisionStatus: {
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: RADIUS.full,
+  cardTitleRow: { flexDirection: 'row', alignItems: 'center', gap: SPACING.sm, flex: 1 },
+  typeBadge: {
+    width: 28, height: 28, borderRadius: 14, alignItems: 'center', justifyContent: 'center',
     borderWidth: 1,
-    borderColor: COLORS.border,
-    backgroundColor: COLORS.bgElevated,
   },
-  projectDecisionStatusText: { color: COLORS.textSecondary, fontSize: 11, fontWeight: '700' },
-  projectDecisionHint: { fontSize: 11, color: COLORS.textMuted, marginBottom: SPACING.sm },
-  multiSelectBar: { flexDirection: 'row', flexWrap: 'wrap', gap: SPACING.sm, marginBottom: SPACING.sm },
-  multiSelectBtn: {
-    paddingHorizontal: 12, paddingVertical: 6,
+  projectName: { fontSize: 15, fontWeight: '700', color: COLORS.textPrimary, flex: 1 },
+  statusBadge: {
+    flexDirection: 'row', alignItems: 'center', gap: 4,
+    paddingHorizontal: 8, paddingVertical: 4, borderRadius: RADIUS.full, borderWidth: 1,
+  },
+  statusBadgeText: { fontSize: 10, fontWeight: '700' },
+  metaRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 5,
+    marginBottom: SPACING.sm,
+  },
+  metaText: { fontSize: 12, color: COLORS.textSecondary, flex: 1 },
+  progressBarWrap: { marginBottom: SPACING.sm },
+  progressBar: {
+    height: 6, borderRadius: 3, backgroundColor: COLORS.bgElevated,
+    flexDirection: 'row', overflow: 'hidden',
+  },
+  progressApproved:  { height: '100%', backgroundColor: COLORS.accent },
+  progressRejected:  { height: '100%', backgroundColor: COLORS.danger },
+  progressPending:   { height: '100%', backgroundColor: COLORS.warning },
+  statsRow: {
+    flexDirection: 'row', alignItems: 'center',
+    backgroundColor: COLORS.bgElevated, borderRadius: RADIUS.md,
+    paddingVertical: SPACING.sm, marginBottom: SPACING.md,
+  },
+  statItem: { flex: 1, alignItems: 'center' },
+  statNum: { fontSize: 16, fontWeight: '800', color: COLORS.textPrimary },
+  statLabel: { fontSize: 9, color: COLORS.textMuted, fontWeight: '600', marginTop: 2, textTransform: 'uppercase', letterSpacing: 0.5 },
+  statDivider: { width: 1, height: 24, backgroundColor: COLORS.border },
+  detailBtn: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: SPACING.xs,
+    paddingVertical: SPACING.md, borderRadius: RADIUS.md,
+    backgroundColor: COLORS.primaryGlow, borderWidth: 1, borderColor: COLORS.primary + '44',
+  },
+  detailBtnText: { fontSize: 13, fontWeight: '700', color: COLORS.primary },
+
+  // Filter Modal
+  filterModalOverlay: {
+    flex: 1, backgroundColor: 'rgba(0,0,0,0.7)',
+    justifyContent: 'flex-end',
+  },
+  filterModal: {
+    backgroundColor: COLORS.bgCard,
+    borderTopLeftRadius: RADIUS.xl, borderTopRightRadius: RADIUS.xl,
+    padding: SPACING.xl, paddingBottom: 40,
+    maxHeight: '75%',
+  },
+  filterModalHeader: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    marginBottom: SPACING.xl,
+  },
+  filterModalTitle: { fontSize: 18, fontWeight: '800', color: COLORS.textPrimary },
+  filterSectionLabel: {
+    fontSize: 11, fontWeight: '700', color: COLORS.textMuted,
+    letterSpacing: 1.5, marginBottom: SPACING.sm, marginTop: SPACING.lg,
+  },
+  filterChips: { flexDirection: 'row', flexWrap: 'wrap', gap: SPACING.xs },
+  filterChip: {
+    flexDirection: 'row', alignItems: 'center', gap: 4,
+    paddingHorizontal: SPACING.md, paddingVertical: 8,
     borderRadius: RADIUS.full, borderWidth: 1, borderColor: COLORS.border,
     backgroundColor: COLORS.bgElevated,
   },
-  multiSelectBtnDisabled: { opacity: 0.5 },
-  multiSelectText: { fontSize: 12, fontWeight: '600', color: COLORS.textSecondary },
-  selectCircle: {
-    width: 20, height: 20, borderRadius: 10,
-    borderWidth: 1, borderColor: COLORS.border,
-    backgroundColor: COLORS.bgCard,
-    alignItems: 'center', justifyContent: 'center',
+  filterChipActive: { backgroundColor: COLORS.primaryGlow, borderColor: COLORS.primary + '88' },
+  filterChipText: { fontSize: 12, fontWeight: '600', color: COLORS.textSecondary },
+  filterChipTextActive: { color: COLORS.primary },
+  filterActions: {
+    flexDirection: 'row', gap: SPACING.md, marginTop: SPACING.xl,
+    paddingTop: SPACING.lg, borderTopWidth: 1, borderTopColor: COLORS.border,
   },
-  selectCircleOn: { backgroundColor: COLORS.primary, borderColor: COLORS.primary },
+  filterResetBtn: {
+    flex: 1, paddingVertical: SPACING.md,
+    alignItems: 'center', justifyContent: 'center',
+    borderRadius: RADIUS.md, borderWidth: 1, borderColor: COLORS.border,
+    backgroundColor: COLORS.bgElevated,
+  },
+  filterResetText: { fontSize: 14, fontWeight: '700', color: COLORS.textSecondary },
+  filterApplyBtn: {
+    flex: 2, paddingVertical: SPACING.md,
+    alignItems: 'center', justifyContent: 'center',
+    borderRadius: RADIUS.md,
+    backgroundColor: COLORS.primary,
+  },
+  filterApplyText: { fontSize: 14, fontWeight: '700', color: COLORS.white },
 });

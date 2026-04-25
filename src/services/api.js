@@ -91,13 +91,28 @@ export const tasksAPI = {
 
 // ─── REVIEWS ────────────────────────────────────────
 export const reviewsAPI = {
-  getPending: () => api.get('/reviews/pending'),
+  getPending: (params) => api.get('/reviews/pending', { params }),
   getReviewed: () => api.get('/reviews/reviewed'),
   getAll: () => api.get('/reviews/all'),
   approve: (id, data) => api.post(`/reviews/${id}/approve`, data),
   reject: (id, data) => api.post(`/reviews/${id}/reject`, data),
   primary: (id) => api.post(`/reviews/${id}/primary`),
   stats: () => api.get('/reviews/stats'),
+};
+
+
+// Reviewer-specific endpoints (mirrors web reviewer)
+export const reviewerAPI = {
+  getQueue: () => api.get('/reviews/projects'),
+  getAllStats: () => api.get('/reviews/projects/all-stats'),
+  getProjectDetail: (projectId) => api.get('/reviews/projects/' + projectId),
+  getSubtopics: (projectId) => api.get('/reviews/projects/' + projectId + '/subtopics'),
+  getProjectStats: (projectId) => api.get('/reviews/projects/' + projectId + '/stats'),
+  getAll: () => api.get('/reviews/all'),
+  getPending: (params) => api.get('/reviews/pending', { params }),
+  // Project-level approve/reject uses /api/projects/:id/approve|reject (from projects.js)
+  approveProject: (projectId, data) => api.post('/projects/' + projectId + '/approve', data),
+  rejectProject: (projectId, data) => api.post('/projects/' + projectId + '/reject', data),
 };
 
 // ─── ACTIVITY LOGS ──────────────────────────────────

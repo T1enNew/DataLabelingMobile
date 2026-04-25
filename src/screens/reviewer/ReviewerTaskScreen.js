@@ -42,7 +42,9 @@ export default function ReviewerTaskScreen({ navigation, route }) {
   const [errorCategory, setErrorCategory] = useState('other');
   const [reviewNotes, setReviewNotes] = useState([]);
   const [addingNote, setAddingNote] = useState(null); // { x, y }
+  const [editingNoteIndex, setEditingNoteIndex] = useState(null);
   const [selectedTextSpanNote, setSelectedTextSpanNote] = useState(null); // { annotatorName, label, text }
+  const [selectedAudioSegmentNote, setSelectedAudioSegmentNote] = useState(null); // { annotatorId, annotatorName, label, start, end }
   const [noteText, setNoteText] = useState('');
   const [settingPrimary, setSettingPrimary] = useState(false);
   const [primaryQueued, setPrimaryQueued] = useState(false);
@@ -54,6 +56,123 @@ export default function ReviewerTaskScreen({ navigation, route }) {
   const [audioWaveWidth, setAudioWaveWidth] = useState(Math.max(220, SCREEN_W - 24));
   const audioSoundRef = useRef(null);
   const [playingSegKey, setPlayingSegKey] = useState('');
+
+  const textSpanKey = useCallback((span) => {
+    if (!span) return '';
+    const annotatorName = String(span.annotatorName || '').trim();
+    const label = String(span.label || '').trim();
+    const text = String(span.text || '').trim();
+    return `${annotatorName}|||${label}|||${text}`;
+  }, []);
+
+  const parsedTextNote = useCallback((note) => {
+    // Supports both new structured notes + legacy `[TEXT] ...` encoded notes
+    if (!note) return null;
+    if (note?.type === 'text' && note?.textSpan) {
+      return {
+        annotatorName: note.textSpan.annotatorName || 'Annotator',
+        label: note.textSpan.label || 'Unknown',
+        text: note.textSpan.text || '—',
+        commentOnly: String(note.commentOnly ?? note.note ?? '').trim(),
+      };
+    }
+    const raw = typeof note.comment === 'string' ? note.comment : '';
+    if (!raw.startsWith('[TEXT]')) return null;
+    const lines = raw.split('\n');
+    const first = lines[0] || '';
+    const metaPart = first.replace('[TEXT] ', '');
+    const [meta = '', textPart = ''] = metaPart.split(': ');
+    const [annotatorName = 'Annotator', label = 'Unknown'] = meta.split(' • ');
+    const commentOnly = lines.slice(1).join('\n').trim();
+    return { annotatorName, label, text: textPart || '—', commentOnly };
+  }, []);
+
+  const textNotesBySpanKey = useMemo(() => {
+    const map = new Map();
+    (reviewNotes || []).forEach((n, idx) => {
+      const parsed = parsedTextNote(n);
+      if (!parsed) return;
+      const key = textSpanKey(parsed);
+      if (!key) return;
+      // Keep the most recent note for this span
+      map.set(key, { idx, ...parsed });
+    });
+    return map;
+  }, [parsedTextNote, reviewNotes, textSpanKey]);
+
+  const audioSegmentKey = useCallback((seg) => {
+    if (!seg) return '';
+    const annotatorId = String(seg.annotatorId || '').trim();
+    const annotatorName = String(seg.annotatorName || '').trim();
+    const label = String(seg.label || '').trim();
+    const start = Number(seg.start ?? seg.startTime ?? 0);
+    const end = Number(seg.end ?? seg.endTime ?? 0);
+    return `${annotatorId}|||${annotatorName}|||${label}|||${start}|||${end}`;
+  }, []);
+
+  const parsedAudioNote = useCallback((note) => {
+    // Supports both new structured notes + legacy `[AUDIO] ...` encoded notes
+    if (!note) return null;
+    if (note?.type === 'audio' && note?.audioSegment) {
+      return {
+        annotatorId: note.audioSegment.annotatorId || '',
+        annotatorName: note.audioSegment.annotatorName || 'Annotator',
+        label: note.audioSegment.label || 'Unknown',
+        start: Number(note.audioSegment.start ?? 0),
+        end: Number(note.audioSegment.end ?? 0),
+        commentOnly: String(note.commentOnly ?? note.note ?? '').trim(),
+      };
+    }
+    const raw = typeof note.comment === 'string' ? note.comment : '';
+    if (!raw.startsWith('[AUDIO]')) return null;
+    const lines = raw.split('\n');
+    const first = lines[0] || '';
+    const metaPart = first.replace('[AUDIO] ', '');
+    // Expected: "AnnotatorName • Label • start-end"
+    const parts = metaPart.split(' • ');
+    const annotatorName = parts[0] || 'Annotator';
+    const label = parts[1] || 'Unknown';
+    const range = parts[2] || '0-0';
+    const [startStr = '0', endStr = '0'] = String(range).split('-');
+    const start = Number(startStr);
+    const end = Number(endStr);
+    const commentOnly = lines.slice(1).join('\n').trim();
+    return { annotatorId: '', annotatorName, label, start, end, commentOnly };
+  }, []);
+
+  const audioNotesBySegmentKey = useMemo(() => {
+    const map = new Map();
+    (reviewNotes || []).forEach((n, idx) => {
+      const parsed = parsedAudioNote(n);
+      if (!parsed) return;
+      const key = audioSegmentKey(parsed);
+      if (!key) return;
+      map.set(key, { idx, ...parsed });
+    });
+    return map;
+  }, [audioSegmentKey, parsedAudioNote, reviewNotes]);
+
+  const beginTextSpanNote = useCallback((span) => {
+    if (!span) return;
+    const key = textSpanKey(span);
+    const existing = key ? textNotesBySpanKey.get(key) : null;
+    setSelectedTextSpanNote(span);
+    setSelectedAudioSegmentNote(null);
+    setAddingNote(null);
+    setEditingNoteIndex(existing ? existing.idx : null);
+    setNoteText(existing ? existing.commentOnly : '');
+  }, [textNotesBySpanKey, textSpanKey]);
+
+  const beginAudioSegmentNote = useCallback((seg) => {
+    if (!seg) return;
+    const key = audioSegmentKey(seg);
+    const existing = key ? audioNotesBySegmentKey.get(key) : null;
+    setSelectedAudioSegmentNote(seg);
+    setSelectedTextSpanNote(null);
+    setAddingNote(null);
+    setEditingNoteIndex(existing ? existing.idx : null);
+    setNoteText(existing ? existing.commentOnly : '');
+  }, [audioNotesBySegmentKey, audioSegmentKey]);
 
   const loadTaskData = useCallback(async ({ preserveLoading = false } = {}) => {
     if (!preserveLoading) setLoading(true);
@@ -108,9 +227,12 @@ export default function ReviewerTaskScreen({ navigation, route }) {
           setProjectTasks(scoped);
         }).catch(() => {});
       }
+
+      return { task: taskRes.data, related: tasks };
     } catch (e) {
       if (!preserveLoading) setLoading(false);
       Alert.alert('Error', e.message);
+      return { task: null, related: [] };
     }
   }, [taskId, allowedAnnotatorIds]);
 
@@ -273,7 +395,7 @@ export default function ReviewerTaskScreen({ navigation, route }) {
 
   const combinedAnnotations = showAnnotatorLabels
     ? (
-      visibleRelatedTasks.length > 0
+      selectableRelatedTasks.length > 0
         ? visibleRelatedTasks.flatMap((t, tIdx) => {
           const aid = t?.annotatorId?._id || t?.annotatorId || `ann_${tIdx}`;
           const labelSet = t?.projectId?.labelSet || labels || [];
@@ -338,21 +460,17 @@ export default function ReviewerTaskScreen({ navigation, route }) {
 
   const baseTextSpans = task?.labels?.spans || task?.labels?.sentences || [];
   const textSpans = showAnnotatorLabels
-    ? (
-      textAnnotatorTasks.length > 0
-        ? textAnnotatorTasks.flatMap((t, tIdx) => {
-          const aid = t?.annotatorId?._id || t?.annotatorId || `ann_${tIdx}`;
-          const name = t?.annotatorId?.fullName || t?.annotatorId?.username || 'Annotator';
-          const spans = t?.labels?.spans || t?.labels?.sentences || [];
-          return spans.map((span, idx) => ({
-            ...span,
-            _id: `${aid}_${idx}`,
-            annotatorId: aid,
-            annotatorName: name,
-          }));
-        })
-        : baseTextSpans
-    )
+    ? textAnnotatorTasks.flatMap((t, tIdx) => {
+      const aid = t?.annotatorId?._id || t?.annotatorId || `ann_${tIdx}`;
+      const name = t?.annotatorId?.fullName || t?.annotatorId?.username || 'Annotator';
+      const spans = t?.labels?.spans || t?.labels?.sentences || [];
+      return spans.map((span, idx) => ({
+        ...span,
+        _id: `${aid}_${idx}`,
+        annotatorId: aid,
+        annotatorName: name,
+      }));
+    })
     : baseTextSpans;
 
   const audioAnnotatorTasks = visibleRelatedTasks.filter((t) => {
@@ -376,21 +494,17 @@ export default function ReviewerTaskScreen({ navigation, route }) {
 
   const baseAudioSegments = task?.labels?.segments || [];
   const audioSegments = showAnnotatorLabels
-    ? (
-      audioAnnotatorTasks.length > 0
-        ? audioAnnotatorTasks.flatMap((t, tIdx) => {
-          const aid = t?.annotatorId?._id || t?.annotatorId || `ann_${tIdx}`;
-          const name = t?.annotatorId?.fullName || t?.annotatorId?.username || 'Annotator';
-          const segments = t?.labels?.segments || [];
-          return segments.map((seg, idx) => ({
-            ...seg,
-            _id: `${aid}_${idx}`,
-            annotatorId: aid,
-            annotatorName: name,
-          }));
-        })
-        : baseAudioSegments
-    )
+    ? audioAnnotatorTasks.flatMap((t, tIdx) => {
+      const aid = t?.annotatorId?._id || t?.annotatorId || `ann_${tIdx}`;
+      const name = t?.annotatorId?.fullName || t?.annotatorId?.username || 'Annotator';
+      const segments = t?.labels?.segments || [];
+      return segments.map((seg, idx) => ({
+        ...seg,
+        _id: `${aid}_${idx}`,
+        annotatorId: aid,
+        annotatorName: name,
+      }));
+    })
     : baseAudioSegments;
 
   const audioDuration = useMemo(() => {
@@ -489,31 +603,60 @@ export default function ReviewerTaskScreen({ navigation, route }) {
     return parts.length > 0 ? parts : [{ type: 'plain', text: textContent }];
   };
 
-  const uniqueProjectItems = projectTasks.reduce((acc, t) => {
-    const key = t?.dataItem?.path || t?.dataItem?.filename || t?._id;
-    if (!key || acc.some((it) => it.key === key)) return acc;
+  const uniqueProjectItems = useMemo(() => {
+    const tasks = Array.isArray(projectTasks) ? projectTasks : [];
+    const byKey = new Map();
 
-    const itemMime = t?.dataItem?.mimeType || '';
-    const itemType = itemMime.startsWith('image/')
-      ? 'image'
-      : itemMime.startsWith('audio/')
-        ? 'audio'
-        : (itemMime.startsWith('text/') || t?.dataItem?.text || t?.dataItem?.content)
-          ? 'text'
-          : 'image';
-
-    acc.push({
-      key,
-      taskId: t._id,
-      status: t.status,
-      type: itemType,
-      thumb: itemType === 'image' && t?.dataItem?.path ? `${BASE_URL}/${t.dataItem.path}` : null,
+    tasks.forEach((t) => {
+      const key = t?.dataItem?.path || t?.dataItem?.filename || t?._id;
+      if (!key) return;
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key).push(t);
     });
-    return acc;
-  }, []);
+
+    const isAllowedAnnotator = (t) => {
+      if (!allowedAnnotatorIds || allowedAnnotatorIds.length === 0) return true;
+      const aid = t?.annotatorId?._id || t?.annotatorId;
+      return !!aid && allowedAnnotatorIds.includes(String(aid));
+    };
+
+    const items = [];
+    byKey.forEach((group, key) => {
+      const remainingSubmitted = group.some((t) => t?.status === 'submitted' && isAllowedAnnotator(t));
+      // Hide items that have no remaining annotator work (after reviewer finished)
+      if (!remainingSubmitted) return;
+
+      const first = group[0];
+      const itemMime = first?.dataItem?.mimeType || '';
+      const itemType = itemMime.startsWith('image/')
+        ? 'image'
+        : itemMime.startsWith('audio/')
+          ? 'audio'
+          : (itemMime.startsWith('text/') || first?.dataItem?.text || first?.dataItem?.content)
+            ? 'text'
+            : 'image';
+
+      // Prefer navigating to a still-submitted taskId for this item
+      const submittedTask = group.find((t) => t?.status === 'submitted' && isAllowedAnnotator(t));
+      const navTaskId = submittedTask?._id || first?._id;
+
+      items.push({
+        key,
+        taskId: navTaskId,
+        status: submittedTask?.status || first?.status,
+        type: itemType,
+        thumb: itemType === 'image' && first?.dataItem?.path ? `${BASE_URL}/${first.dataItem.path}` : null,
+      });
+    });
+
+    return items;
+  }, [allowedAnnotatorIds, projectTasks]);
+
+  const submittedRelatedTasks = selectableRelatedTasks.filter((t) => t?.status === 'submitted');
 
   const selectedActionAnnotatorId = infoAnnotatorId
     || activeAnnotatorId
+    || (submittedRelatedTasks[0]?.annotatorId?._id || submittedRelatedTasks[0]?.annotatorId)
     || (allowedAnnotatorIds && allowedAnnotatorIds.length > 0 ? allowedAnnotatorIds[0] : (task?.annotatorId?._id || task?.annotatorId || ''));
 
   const selectedActionTask = relatedTasks.find((t) => {
@@ -529,6 +672,33 @@ export default function ReviewerTaskScreen({ navigation, route }) {
     || task?.annotatorId?.fullName
     || task?.annotatorId?.username
     || 'annotator';
+
+  const primaryAlreadySetForItem = useMemo(() => {
+    if (task?.primaryForItem) return true;
+    if (selectedActionTask?.primaryForItem) return true;
+    return (Array.isArray(relatedTasks) ? relatedTasks : []).some((t) => !!t?.primaryForItem);
+  }, [relatedTasks, selectedActionTask?.primaryForItem, task?.primaryForItem]);
+
+  const pickNextSubmittedAnnotatorId = useCallback((tasks, excludeAnnotatorId) => {
+    const list = Array.isArray(tasks) ? tasks : [];
+    const exclude = excludeAnnotatorId ? String(excludeAnnotatorId) : '';
+    const allowed = Array.isArray(allowedAnnotatorIds) && allowedAnnotatorIds.length > 0
+      ? new Set(allowedAnnotatorIds.map((x) => String(x)))
+      : null;
+
+    const remaining = list.filter((t) => {
+      if (t?.status !== 'submitted') return false;
+      const aid = t?.annotatorId?._id || t?.annotatorId;
+      if (!aid) return false;
+      const aidStr = String(aid);
+      if (exclude && aidStr === exclude) return false;
+      if (allowed && !allowed.has(aidStr)) return false;
+      return true;
+    });
+
+    const nextId = remaining[0]?.annotatorId?._id || remaining[0]?.annotatorId;
+    return nextId ? String(nextId) : '';
+  }, [allowedAnnotatorIds]);
 
   const handleApprove = async () => {
     if (!canScoreSelectedTask) {
@@ -548,6 +718,9 @@ export default function ReviewerTaskScreen({ navigation, route }) {
               try {
                 await reviewsAPI.primary(actionTaskId);
                 setTask(prev => prev ? { ...prev, primaryForItem: true } : prev);
+                setRelatedTasks((prev) => (Array.isArray(prev)
+                  ? prev.map((t) => (t?._id === actionTaskId ? { ...t, primaryForItem: true } : t))
+                  : prev));
               } catch (e) {
                 Alert.alert('Approved', 'Task approved but failed to set primary. Please try again.');
               }
@@ -555,7 +728,17 @@ export default function ReviewerTaskScreen({ navigation, route }) {
             setReviewNotes([]);
             setSelectedTextSpanNote(null);
             setNoteText('');
-            await loadTaskData({ preserveLoading: true });
+            const { related } = await loadTaskData({ preserveLoading: true }) || {};
+            const latestRelated = Array.isArray(related) ? related : [];
+            const nextId = pickNextSubmittedAnnotatorId(latestRelated, selectedActionAnnotatorId);
+            if (nextId) {
+              setInfoAnnotatorId(nextId);
+              setActiveAnnotatorId(nextId);
+            } else {
+              // No more annotators to score for this item
+              setInfoAnnotatorId('');
+              setActiveAnnotatorId('all');
+            }
             Alert.alert('Approved!', 'Task has been approved.');
           } catch (e) {
             Alert.alert('Error', e.message);
@@ -578,7 +761,7 @@ export default function ReviewerTaskScreen({ navigation, route }) {
       return;
     }
     if (reviewNotes.length === 0) {
-      Alert.alert('Required', 'Please add at least one feedback note on the image.');
+      Alert.alert('Required', 'Please add at least one feedback note (image / text span / audio segment).');
       return;
     }
     setRejecting(true);
@@ -593,7 +776,16 @@ export default function ReviewerTaskScreen({ navigation, route }) {
       setSelectedTextSpanNote(null);
       setNoteText('');
       setRejectComment('');
-      await loadTaskData({ preserveLoading: true });
+      const { related } = await loadTaskData({ preserveLoading: true }) || {};
+      const latestRelated = Array.isArray(related) ? related : [];
+      const nextId = pickNextSubmittedAnnotatorId(latestRelated, selectedActionAnnotatorId);
+      if (nextId) {
+        setInfoAnnotatorId(nextId);
+        setActiveAnnotatorId(nextId);
+      } else {
+        setInfoAnnotatorId('');
+        setActiveAnnotatorId('all');
+      }
       Alert.alert('Rejected', 'Task has been rejected with feedback.');
     } catch (e) {
       Alert.alert('Error', e.message);
@@ -603,6 +795,14 @@ export default function ReviewerTaskScreen({ navigation, route }) {
   };
 
   const handleSetPrimary = async () => {
+    if (primaryAlreadySetForItem) {
+      Alert.alert('Primary already set', 'This item already has a primary. You can only set primary once per item.');
+      return;
+    }
+    if (!canScoreSelectedTask) {
+      Alert.alert('Cannot set primary', 'You can only set primary while this annotator task is still submitted (before approve/reject).');
+      return;
+    }
     if (!isApproved) {
       setPrimaryQueued((prev) => !prev);
       return;
@@ -616,6 +816,9 @@ export default function ReviewerTaskScreen({ navigation, route }) {
           try {
             await reviewsAPI.primary(actionTaskId);
             setTask(prev => prev ? { ...prev, primaryForItem: true } : prev);
+            setRelatedTasks((prev) => (Array.isArray(prev)
+              ? prev.map((t) => (t?._id === actionTaskId ? { ...t, primaryForItem: true } : t))
+              : prev));
             Alert.alert('Success', 'Primary image has been set.');
           } catch (e) {
             Alert.alert('Error', e.message);
@@ -639,28 +842,132 @@ export default function ReviewerTaskScreen({ navigation, route }) {
 
     if (selectedTextSpanNote) {
       const meta = `${selectedTextSpanNote.annotatorName || 'Annotator'} • ${selectedTextSpanNote.label || 'Unknown'}`;
-      setReviewNotes(prev => [...prev, {
-        bbox: [0, 0, 0, 0],
-        comment: `[TEXT] ${meta}: ${selectedTextSpanNote.text || '—'}\n${noteText.trim()}`,
-        label: selectedTextSpanNote.label || null,
-      }]);
+      const spanPayload = {
+        annotatorName: selectedTextSpanNote.annotatorName || 'Annotator',
+        label: selectedTextSpanNote.label || 'Unknown',
+        text: selectedTextSpanNote.text || '—',
+      };
+      if (editingNoteIndex !== null) {
+        setReviewNotes(prev => prev.map((n, i) => (i === editingNoteIndex
+          ? {
+            ...n,
+            type: 'text',
+            textSpan: spanPayload,
+            commentOnly: noteText.trim(),
+            comment: `[TEXT] ${meta}: ${selectedTextSpanNote.text || '—'}\n${noteText.trim()}`,
+            label: selectedTextSpanNote.label || null,
+          }
+          : n)));
+      } else {
+        setReviewNotes(prev => [...prev, {
+          bbox: [0, 0, 0, 0],
+          type: 'text',
+          textSpan: spanPayload,
+          commentOnly: noteText.trim(),
+          comment: `[TEXT] ${meta}: ${selectedTextSpanNote.text || '—'}\n${noteText.trim()}`,
+          label: selectedTextSpanNote.label || null,
+        }]);
+      }
       setSelectedTextSpanNote(null);
+      setEditingNoteIndex(null);
+      setNoteText('');
+      return;
+    }
+
+    if (selectedAudioSegmentNote) {
+      const start = Number(selectedAudioSegmentNote?.start ?? selectedAudioSegmentNote?.startTime ?? 0);
+      const end = Number(selectedAudioSegmentNote?.end ?? selectedAudioSegmentNote?.endTime ?? 0);
+      const meta = `${selectedAudioSegmentNote.annotatorName || 'Annotator'} • ${selectedAudioSegmentNote.label || 'Unknown'} • ${start}-${end}`;
+      const segPayload = {
+        annotatorId: selectedAudioSegmentNote.annotatorId || '',
+        annotatorName: selectedAudioSegmentNote.annotatorName || 'Annotator',
+        label: selectedAudioSegmentNote.label || 'Unknown',
+        start,
+        end,
+      };
+      if (editingNoteIndex !== null) {
+        setReviewNotes(prev => prev.map((n, i) => (i === editingNoteIndex
+          ? {
+            ...n,
+            type: 'audio',
+            audioSegment: segPayload,
+            commentOnly: noteText.trim(),
+            comment: `[AUDIO] ${meta}\n${noteText.trim()}`,
+            label: selectedAudioSegmentNote.label || null,
+          }
+          : n)));
+      } else {
+        setReviewNotes(prev => [...prev, {
+          bbox: [0, 0, 0, 0],
+          type: 'audio',
+          audioSegment: segPayload,
+          commentOnly: noteText.trim(),
+          comment: `[AUDIO] ${meta}\n${noteText.trim()}`,
+          label: selectedAudioSegmentNote.label || null,
+        }]);
+      }
+      setSelectedAudioSegmentNote(null);
+      setEditingNoteIndex(null);
       setNoteText('');
       return;
     }
 
     if (!addingNote) return;
 
-    setReviewNotes(prev => [...prev, {
-      bbox: [addingNote.x - 15, addingNote.y - 15, 30, 30],
-      comment: noteText.trim(),
-      label: null,
-    }]);
+    if (editingNoteIndex !== null) {
+      setReviewNotes(prev => prev.map((n, i) => (i === editingNoteIndex
+        ? { ...n, comment: noteText.trim(), bbox: [addingNote.x - 15, addingNote.y - 15, 30, 30] }
+        : n)));
+    } else {
+      setReviewNotes(prev => [...prev, {
+        bbox: [addingNote.x - 15, addingNote.y - 15, 30, 30],
+        comment: noteText.trim(),
+        label: null,
+      }]);
+    }
     setAddingNote(null);
+    setEditingNoteIndex(null);
     setNoteText('');
   };
 
   const removeNote = (idx) => setReviewNotes(prev => prev.filter((_, i) => i !== idx));
+
+  const editNote = (note, idx) => {
+    if (!note) return;
+    setEditingNoteIndex(idx);
+
+    const parsed = parsedTextNote(note);
+    if (parsed) {
+      setSelectedTextSpanNote({ annotatorName: parsed.annotatorName, label: parsed.label, text: parsed.text });
+      setSelectedAudioSegmentNote(null);
+      setAddingNote(null);
+      setNoteText(parsed.commentOnly || '');
+      return;
+    }
+
+    const parsedA = parsedAudioNote(note);
+    if (parsedA) {
+      setSelectedAudioSegmentNote({
+        annotatorId: parsedA.annotatorId,
+        annotatorName: parsedA.annotatorName,
+        label: parsedA.label,
+        start: parsedA.start,
+        end: parsedA.end,
+      });
+      setSelectedTextSpanNote(null);
+      setAddingNote(null);
+      setNoteText(parsedA.commentOnly || '');
+      return;
+    }
+
+    setSelectedTextSpanNote(null);
+    setSelectedAudioSegmentNote(null);
+    setAddingNote({
+      x: (note?.bbox?.[0] || 0) + 15,
+      y: (note?.bbox?.[1] || 0) + 15,
+    });
+    setNoteText(note?.comment || '');
+  };
 
   useEffect(() => {
     const visibleAnnotatorIds = selectableRelatedTasks
@@ -820,7 +1127,7 @@ export default function ReviewerTaskScreen({ navigation, route }) {
                       const aid = t?.annotatorId?._id || t?.annotatorId;
                       const name = t?.annotatorId?.fullName || t?.annotatorId?.username || 'Annotator';
                       const isOn = annotatorVisibility[aid] !== false;
-                      const isActive = activeAnnotatorId === aid;
+                      const isActive = isOn && activeAnnotatorId === aid;
                       return (
                         <TouchableOpacity
                           key={aid}
@@ -881,9 +1188,48 @@ export default function ReviewerTaskScreen({ navigation, route }) {
                     </React.Fragment>
                   );
                 })}
-                {reviewNotes.map((note, i) => (
-                  <Circle key={i} cx={note.bbox[0] + 15} cy={note.bbox[1] + 15} r={14} fill={COLORS.danger + 'AA'} stroke={COLORS.danger} strokeWidth={2} />
-                ))}
+                {reviewNotes.map((note, i) => {
+                  const markerX = note.bbox[0] + 15;
+                  const markerY = note.bbox[1] + 15;
+                  const shortText = String(note.comment || '').replace(/\s+/g, ' ').trim().slice(0, 28);
+                  const bubbleText = `${i + 1}. ${shortText}`;
+                  const approxWidth = Math.max(56, Math.min(220, bubbleText.length * 5.8 + 14));
+                  const maxW = containerSize.width || imgSize.width;
+                  const textX = Math.max(6, Math.min(markerX + 18, maxW - approxWidth - 6));
+                  const textY = Math.max(14, markerY + 4);
+                  return (
+                    <React.Fragment key={i}>
+                      <Circle
+                        cx={markerX}
+                        cy={markerY}
+                        r={14}
+                        fill={COLORS.danger}
+                        stroke={editingNoteIndex === i ? COLORS.warning : COLORS.white}
+                        strokeWidth={2}
+                        onPress={() => !isReadOnly && editNote(note, i)}
+                      />
+                      <Rect
+                        x={textX - 4}
+                        y={textY - 11}
+                        width={approxWidth}
+                        height={16}
+                        rx={4}
+                        fill="rgba(0,0,0,0.75)"
+                        stroke={editingNoteIndex === i ? COLORS.warning : 'rgba(255,255,255,0.45)'}
+                        strokeWidth={1}
+                      />
+                      <SvgText
+                        x={textX}
+                        y={textY}
+                        fontSize="10"
+                        fill={COLORS.white}
+                        fontWeight="700"
+                      >
+                        {bubbleText}
+                      </SvgText>
+                    </React.Fragment>
+                  );
+                })}
                 {addingNote && (
                   <Circle cx={addingNote.x} cy={addingNote.y} r={14} fill={COLORS.warning + '88'} stroke={COLORS.warning} strokeWidth={2} />
                 )}
@@ -902,8 +1248,17 @@ export default function ReviewerTaskScreen({ navigation, route }) {
                   multiline
                 />
                 <View style={styles.noteActions}>
-                  <Button title="Cancel" onPress={() => setAddingNote(null)} variant="ghost" size="sm" />
-                  <Button title="Add Note" onPress={addNote} size="sm" />
+                  <Button
+                    title="Cancel"
+                    onPress={() => {
+                      setAddingNote(null);
+                      setEditingNoteIndex(null);
+                      setNoteText('');
+                    }}
+                    variant="ghost"
+                    size="sm"
+                  />
+                  <Button title={editingNoteIndex !== null ? 'Save Note' : 'Add Note'} onPress={addNote} size="sm" />
                 </View>
               </View>
             )}
@@ -911,15 +1266,22 @@ export default function ReviewerTaskScreen({ navigation, route }) {
             {reviewNotes.length > 0 && (
               <View style={styles.notesList}>
                 {reviewNotes.map((note, i) => (
-                  <View key={i} style={styles.noteItem}>
-                    <View style={styles.noteNum}>
-                      <Text style={styles.noteNumText}>{i + 1}</Text>
-                    </View>
-                    <Text style={styles.noteText} numberOfLines={2}>{note.comment}</Text>
+                  <View key={i} style={[styles.noteItem, editingNoteIndex === i && styles.noteItemEditing]}>
+                    <TouchableOpacity style={styles.noteItemMain} onPress={() => !isReadOnly && editNote(note, i)} activeOpacity={0.8}>
+                      <View style={styles.noteNum}>
+                        <Text style={styles.noteNumText}>{i + 1}</Text>
+                      </View>
+                      <Text style={styles.noteText} numberOfLines={2}>{note.comment}</Text>
+                    </TouchableOpacity>
                     {!isReadOnly && (
-                      <TouchableOpacity onPress={() => removeNote(i)}>
-                        <Ionicons name="close-circle" size={18} color={COLORS.danger} />
-                      </TouchableOpacity>
+                      <View style={styles.noteItemActions}>
+                        <TouchableOpacity onPress={() => editNote(note, i)}>
+                          <Ionicons name="create-outline" size={18} color={COLORS.warning} />
+                        </TouchableOpacity>
+                        <TouchableOpacity onPress={() => removeNote(i)}>
+                          <Ionicons name="close-circle" size={18} color={COLORS.danger} />
+                        </TouchableOpacity>
+                      </View>
                     )}
                   </View>
                 ))}
@@ -981,8 +1343,8 @@ export default function ReviewerTaskScreen({ navigation, route }) {
               {showAnnotatorLabels && textAnnotatorStats.length > 0 && (
                 <View style={styles.textAnnotatorGrid}>
                   {textAnnotatorStats.map((a) => {
-                    const isFocused = activeAnnotatorId === a.aid;
                     const isVisible = annotatorVisibility[a.aid] !== false;
+                    const isFocused = isVisible && activeAnnotatorId === a.aid;
                     return (
                       <TouchableOpacity
                         key={a.aid}
@@ -992,8 +1354,12 @@ export default function ReviewerTaskScreen({ navigation, route }) {
                           isFocused && styles.textAnnotatorCardFocus,
                         ]}
                         onPress={() => {
-                          setAnnotatorVisibility((prev) => ({ ...prev, [a.aid]: !isVisible }));
-                          setActiveAnnotatorId((prev) => (prev === a.aid ? 'all' : a.aid));
+                          const nextVisible = !isVisible;
+                          setAnnotatorVisibility((prev) => ({ ...prev, [a.aid]: nextVisible }));
+                          setActiveAnnotatorId((prev) => {
+                            if (!nextVisible && prev === a.aid) return 'all';
+                            return prev;
+                          });
                         }}
                       >
                         <Text style={[styles.textAnnotatorName, isVisible && styles.textAnnotatorNameOn]} numberOfLines={1}>{a.name}</Text>
@@ -1026,18 +1392,23 @@ export default function ReviewerTaskScreen({ navigation, route }) {
                             return (
                               <View key={`${ann.aid}_${labelName}`} style={styles.splitRowItem}>
                                 <View style={styles.splitRowHeader}>
-                                  <Tag label={labelName} color={labelDef?.color} />
+                                  <Tag
+                                    label={showAnnotatorLabels ? `${labelName} • ${ann.name}` : labelName}
+                                    color={labelDef?.color}
+                                  />
                                   <Text style={styles.splitRowCount}>{snippets.length}</Text>
                                 </View>
                                 <View style={styles.splitSnippetWrap}>
                                   {snippets.slice(0, 4).map((item, idx) => (
+                                    (() => {
+                                      const key = textSpanKey(item);
+                                      const existing = key ? textNotesBySpanKey.get(key) : null;
+                                      return (
                                     <TouchableOpacity
                                       key={`${ann.aid}_${labelName}_${idx}`}
                                       onPress={() => {
                                         if (isReadOnly) return;
-                                        setSelectedTextSpanNote(item);
-                                        setAddingNote(null);
-                                        setNoteText('');
+                                        beginTextSpanNote(item);
                                       }}
                                       activeOpacity={0.8}
                                       style={[
@@ -1051,7 +1422,14 @@ export default function ReviewerTaskScreen({ navigation, route }) {
                                       <Text style={styles.splitSnippetText}>
                                         • {item.text}
                                       </Text>
+                                      {existing?.commentOnly ? (
+                                        <Text style={styles.textSpanNotePreview} numberOfLines={1}>
+                                          Note: {existing.commentOnly}
+                                        </Text>
+                                      ) : null}
                                     </TouchableOpacity>
+                                      );
+                                    })()
                                   ))}
                                   {snippets.length > 4 && (
                                     <Text style={styles.splitMoreText}>+{snippets.length - 4} more</Text>
@@ -1077,18 +1455,29 @@ export default function ReviewerTaskScreen({ navigation, route }) {
                         return <Text key={`plain-${idx}`} style={styles.textPlain}>{part.text}</Text>;
                       }
                       const labelDef = labels.find((l) => l.name === part.label);
+                      const key = textSpanKey({ annotatorName: part.annotatorName, label: part.label, text: part.text });
+                      const existing = key ? textNotesBySpanKey.get(key) : null;
                       return (
                         <Text
                           key={`label-${idx}`}
                           style={[
                             styles.textLabelHighlight,
+                            existing?.commentOnly && styles.textLabelHighlightHasNote,
                             {
                               backgroundColor: (labelDef?.color || COLORS.primary) + '33',
                               borderColor: (labelDef?.color || COLORS.primary) + 'AA',
                             },
                           ]}
+                          onPress={() => {
+                            if (isReadOnly) return;
+                            beginTextSpanNote({
+                              annotatorName: part.annotatorName || 'Annotator',
+                              label: part.label || 'Unknown',
+                              text: part.text || '—',
+                            });
+                          }}
                         >
-                          {part.text}
+                          {showAnnotatorLabels && part.annotatorName ? `[${part.annotatorName}] ` : ''}{part.text}
                         </Text>
                       );
                     })}
@@ -1121,12 +1510,13 @@ export default function ReviewerTaskScreen({ navigation, route }) {
                     title="Cancel"
                     onPress={() => {
                       setSelectedTextSpanNote(null);
+                      setEditingNoteIndex(null);
                       setNoteText('');
                     }}
                     variant="ghost"
                     size="sm"
                   />
-                  <Button title="Add Note" onPress={addNote} size="sm" />
+                  <Button title={editingNoteIndex !== null ? 'Save Note' : 'Add Note'} onPress={addNote} size="sm" />
                 </View>
               </View>
             )}
@@ -1176,8 +1566,8 @@ export default function ReviewerTaskScreen({ navigation, route }) {
               {showAnnotatorLabels && audioAnnotatorStats.length > 0 && (
                 <View style={styles.textAnnotatorGrid}>
                   {audioAnnotatorStats.map((a) => {
-                    const isFocused = activeAnnotatorId === a.aid;
                     const isVisible = annotatorVisibility[a.aid] !== false;
+                    const isFocused = isVisible && activeAnnotatorId === a.aid;
                     return (
                       <TouchableOpacity
                         key={a.aid}
@@ -1272,16 +1662,46 @@ export default function ReviewerTaskScreen({ navigation, route }) {
                             const end = Number(seg?.end ?? seg?.endTime ?? 0);
                             const segKey = `${ann.aid}-${idx}-${start}-${end}-${labelName}`;
                             const isPlaying = playingSegKey === segKey;
+                            const segForNote = {
+                              annotatorId: ann.aid,
+                              annotatorName: ann.name,
+                              label: labelName,
+                              start,
+                              end,
+                            };
+                            const noteKey = audioSegmentKey(segForNote);
+                            const existing = noteKey ? audioNotesBySegmentKey.get(noteKey) : null;
+                            const isActive = selectedAudioSegmentNote
+                              && selectedAudioSegmentNote.annotatorId === segForNote.annotatorId
+                              && selectedAudioSegmentNote.label === segForNote.label
+                              && Number(selectedAudioSegmentNote.start) === Number(segForNote.start)
+                              && Number(selectedAudioSegmentNote.end) === Number(segForNote.end);
                             return (
-                              <View key={segKey} style={styles.simpleListRow}>
+                              <TouchableOpacity
+                                key={segKey}
+                                style={[styles.simpleListRow, isActive && styles.audioSegmentRowActive]}
+                                activeOpacity={0.85}
+                                onPress={() => {
+                                  if (isReadOnly) return;
+                                  beginAudioSegmentNote(segForNote);
+                                }}
+                              >
                                 <View style={styles.simpleListHeaderRow}>
                                   <Text style={styles.simpleListTitle}>#{idx + 1}</Text>
                                   <TouchableOpacity onPress={() => playAudioSegment(seg, segKey)} activeOpacity={0.8}>
-                                    <Tag label={labelName} color={isPlaying ? COLORS.statusApproved : labelDef?.color} />
+                                    <Tag
+                                      label={showAnnotatorLabels ? `${labelName} • ${ann.name}` : labelName}
+                                      color={isPlaying ? COLORS.statusApproved : labelDef?.color}
+                                    />
                                   </TouchableOpacity>
                                 </View>
                                 <Text style={styles.simpleListValue}>{start} - {end}</Text>
-                              </View>
+                                {existing?.commentOnly ? (
+                                  <Text style={styles.audioSegmentNotePreview} numberOfLines={2}>
+                                    Note: {existing.commentOnly}
+                                  </Text>
+                                ) : null}
+                              </TouchableOpacity>
                             );
                           })}
                         </View>
@@ -1289,6 +1709,39 @@ export default function ReviewerTaskScreen({ navigation, route }) {
                     })}
                   </View>
                 </>
+              )}
+
+              {selectedAudioSegmentNote && !isReadOnly && (
+                <View style={styles.addNoteBox}>
+                  <Text style={styles.textNoteContext}>
+                    Đang ghi chú cho: {selectedAudioSegmentNote.annotatorName} • {selectedAudioSegmentNote.label}
+                  </Text>
+                  <Text style={styles.textNoteSnippet} numberOfLines={2}>
+                    Segment: {Number(selectedAudioSegmentNote.start)} - {Number(selectedAudioSegmentNote.end)}
+                  </Text>
+                  <TextInput
+                    style={styles.noteInput}
+                    placeholder="Feedback note for this audio segment..."
+                    placeholderTextColor={COLORS.textMuted}
+                    value={noteText}
+                    onChangeText={setNoteText}
+                    autoFocus
+                    multiline
+                  />
+                  <View style={styles.noteActions}>
+                    <Button
+                      title="Cancel"
+                      onPress={() => {
+                        setSelectedAudioSegmentNote(null);
+                        setEditingNoteIndex(null);
+                        setNoteText('');
+                      }}
+                      variant="ghost"
+                      size="sm"
+                    />
+                    <Button title={editingNoteIndex !== null ? 'Save Note' : 'Add Note'} onPress={addNote} size="sm" />
+                  </View>
+                </View>
               )}
             </Card>
           </View>
@@ -1443,7 +1896,7 @@ export default function ReviewerTaskScreen({ navigation, route }) {
           </>
         )}
 
-        {!isReadOnly && datasetType === 'image' && !task.primaryForItem && (
+        {!isReadOnly && datasetType === 'image' && !primaryAlreadySetForItem && canScoreSelectedTask && (
           <View style={styles.primaryArea}>
             <Button
               title={primaryQueued && !isApproved ? 'Primary Queued' : 'Set Primary'}
@@ -1566,12 +2019,31 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.dangerGlow, padding: SPACING.sm, borderRadius: RADIUS.sm,
     borderWidth: 1, borderColor: COLORS.danger + '33',
   },
+  noteItemEditing: {
+    borderColor: COLORS.warning,
+    backgroundColor: COLORS.warningGlow,
+  },
+  noteItemMain: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: SPACING.sm,
+  },
+  noteItemActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: SPACING.sm,
+  },
   noteNum: {
     width: 22, height: 22, borderRadius: 11,
     backgroundColor: COLORS.danger, alignItems: 'center', justifyContent: 'center',
   },
   noteNumText: { fontSize: 12, fontWeight: '700', color: COLORS.white },
   noteText: { flex: 1, fontSize: 12, color: COLORS.textPrimary },
+  textSpanNotePreview: { marginTop: 4, fontSize: 11, color: COLORS.textMuted },
+  textLabelHighlightHasNote: { borderBottomWidth: 2, borderBottomColor: COLORS.warning },
+  audioSegmentNotePreview: { marginTop: 6, fontSize: 11, color: COLORS.textMuted },
+  audioSegmentRowActive: { backgroundColor: COLORS.primary + '14' },
   labelsWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: SPACING.sm },
   labelCountItem: { flexDirection: 'row', alignItems: 'center', gap: 4 },
   labelCountNum: { fontSize: 12, fontWeight: '700', color: COLORS.textSecondary },
@@ -1580,9 +2052,22 @@ const styles = StyleSheet.create({
   actionTargetHint: {
     marginTop: SPACING.lg,
     marginBottom: SPACING.sm,
-    fontSize: 12,
-    color: COLORS.textMuted,
-    fontWeight: '700',
+    fontSize: 14,
+    color: '#FFD84D',
+    fontWeight: '900',
+    letterSpacing: 0.5,
+    textTransform: 'uppercase',
+    backgroundColor: '#3A2A00',
+    borderWidth: 1,
+    borderColor: '#FFB800',
+    borderRadius: RADIUS.sm,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    shadowColor: '#FFB800',
+    shadowOpacity: 0.35,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 3,
   },
   actionArea: {
     flexDirection: 'row', gap: SPACING.md, marginTop: SPACING.xs,

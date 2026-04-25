@@ -1,3 +1,8 @@
+/**
+ * ReviewerNavigator - Updated with full reviewer workflow
+ * Workflow: Queue -> ProjectDetail -> Subtopic -> Tasks -> ReviewTask
+ */
+
 import React from 'react';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
@@ -5,7 +10,9 @@ import { Ionicons } from '@expo/vector-icons';
 import { COLORS } from '../theme';
 
 import ReviewerQueueScreen from '../screens/reviewer/ReviewerQueueScreen';
-import ReviewerTaskScreen from '../screens/reviewer/ReviewerTaskScreen';
+import ReviewerProjectDetailScreen from '../screens/reviewer/ReviewerProjectDetailScreen';
+import ReviewerSubtopicScreen from '../screens/reviewer/ReviewerSubtopicScreen';
+import ReviewerTasksScreen from '../screens/reviewer/ReviewerTasksScreen';
 import ReviewerHistoryScreen from '../screens/reviewer/ReviewerHistoryScreen';
 import ReviewerProfileScreen from '../screens/reviewer/ReviewerProfileScreen';
 
@@ -14,20 +21,28 @@ const QueueStack = createNativeStackNavigator();
 const HistoryStack = createNativeStackNavigator();
 const ProfileStack = createNativeStackNavigator();
 
+/**
+ * Queue stack: Queue -> ProjectDetail -> Subtopic -> Tasks -> ReviewTask
+ */
 function QueueStackNav() {
   return (
     <QueueStack.Navigator screenOptions={{ headerShown: false }}>
       <QueueStack.Screen name="ReviewerQueue" component={ReviewerQueueScreen} />
-      <QueueStack.Screen name="ReviewerTask" component={ReviewerTaskScreen} />
+      <QueueStack.Screen name="ReviewerProjectDetail" component={ReviewerProjectDetailScreen} />
+      <QueueStack.Screen name="ReviewerSubtopic" component={ReviewerSubtopicScreen} />
+      <QueueStack.Screen name="ReviewerTasks" component={ReviewerTasksScreen} />
     </QueueStack.Navigator>
   );
 }
 
+/**
+ * History stack: History -> ReviewTask (read-only)
+ */
 function HistoryStackNav() {
   return (
     <HistoryStack.Navigator screenOptions={{ headerShown: false }}>
       <HistoryStack.Screen name="ReviewerHistory" component={ReviewerHistoryScreen} />
-      <HistoryStack.Screen name="ReviewerTask" component={ReviewerTaskScreen} />
+      <HistoryStack.Screen name="ReviewerTask" component={ReviewerTasksScreen} />
     </HistoryStack.Navigator>
   );
 }
